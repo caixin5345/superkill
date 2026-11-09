@@ -15,6 +15,8 @@ jobs:
     env:
       APP_GROUP: group.cc.replace.superkill
       BUNDLE_ID: cc.replace.superkill
+      # 想改桌面显示名，只改这一行即可
+      APP_NAME: 智商清除
     steps:
       - name: 写入源码与工程文件
         run: |
@@ -1129,7 +1131,8 @@ jobs:
           - (void)viewDidLoad {
               [super viewDidLoad];
 
-              self.title = @"监管开关";
+              NSString *displayName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"];
+              self.title = displayName.length ? displayName : @"智商清除";
               self.view.backgroundColor = [UIColor systemBackgroundColor];
 
               self.engine = [[SKEngine alloc] init];
@@ -1791,11 +1794,31 @@ jobs:
           	<key>CFBundleDevelopmentRegion</key>
           	<string>zh_CN</string>
           	<key>CFBundleDisplayName</key>
-          	<string>监管开关</string>
+          	<string>智商清除</string>
           	<key>CFBundleExecutable</key>
           	<string>$(EXECUTABLE_NAME)</string>
           	<key>CFBundleIdentifier</key>
           	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+          	<key>CFBundleIcons</key>
+          	<dict>
+          		<key>CFBundlePrimaryIcon</key>
+          		<dict>
+          			<key>CFBundleIconFiles</key>
+          			<array>
+          				<string>AppIcon60x60</string>
+          			</array>
+          		</dict>
+          	</dict>
+          	<key>CFBundleIcons~ipad</key>
+          	<dict>
+          		<key>CFBundlePrimaryIcon</key>
+          		<dict>
+          			<key>CFBundleIconFiles</key>
+          			<array>
+          				<string>AppIcon76x76</string>
+          			</array>
+          		</dict>
+          	</dict>
           	<key>CFBundleInfoDictionaryVersion</key>
           	<string>6.0</string>
           	<key>CFBundleName</key>
@@ -1870,6 +1893,10 @@ jobs:
               platform: iOS
               sources:
                 - path: Sources
+                - path: Resources/AppIcon60x60@2x.png
+                - path: Resources/AppIcon60x60@3x.png
+                - path: Resources/AppIcon76x76.png
+                - path: Resources/AppIcon76x76@2x.png
               settings:
                 base:
                   PRODUCT_NAME: SuperKill
@@ -1883,6 +1910,17 @@ jobs:
               scheme:
                 gatherCoverageData: false
           SK_EOF_11_PROJECT_YML
+          python3 - <<'SK_ICON_B64'
+          import base64, pathlib
+          data = """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"""
+          pathlib.Path("/tmp/sk_default_icon.png").write_bytes(base64.b64decode("".join(data.split())))
+          SK_ICON_B64
+          SRC=/tmp/sk_default_icon.png
+          if [ -f icon.png ]; then SRC=icon.png; echo "[*] 使用仓库根目录的 icon.png"; fi
+          sips -z 180 180 "$SRC" --out Resources/AppIcon60x60@3x.png >/dev/null
+          sips -z 120 120 "$SRC" --out Resources/AppIcon60x60@2x.png >/dev/null
+          sips -z 76 76 "$SRC" --out Resources/AppIcon76x76.png >/dev/null
+          sips -z 152 152 "$SRC" --out Resources/AppIcon76x76@2x.png >/dev/null
 
       - name: 安装 XcodeGen
         run: brew install xcodegen
@@ -1905,6 +1943,7 @@ jobs:
           mkdir -p build/out/Payload
           cp -R build/app/SuperKill.app build/out/Payload/
           /usr/libexec/PlistBuddy -c "Set :SKAppGroup $APP_GROUP" build/out/Payload/SuperKill.app/Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" build/out/Payload/SuperKill.app/Info.plist || true
           cd build/out && zip -qry SuperKill-unsigned.ipa Payload
           ls -lh SuperKill-unsigned.ipa
 
