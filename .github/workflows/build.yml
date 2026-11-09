@@ -16,7 +16,7 @@ jobs:
       APP_GROUP: group.cc.replace.superkill
       BUNDLE_ID: cc.replace.superkill
       # 想改桌面显示名，只改这一行即可
-      APP_NAME: 智商清除
+      APP_NAME: 割韭菜最终版本
     steps:
       - name: 写入源码与工程文件
         run: |
@@ -81,9 +81,9 @@ jobs:
           //  SKEngine.h
           //  SuperKill
           //
-          //  监管（Supervision）/ MDM 状态清除引擎。
+          //  监管（Supervision）状态读取与清除引擎。
           //  通过 worse_query 取得 systemgroup.com.apple.configurationprofiles 的读写权限，
-          //  然后备份 / 删除 / 补丁 / 回滚监管相关 plist。
+          //  然后删除监管与 MDM 的落盘状态。
           //
 
           #import <Foundation/Foundation.h>
@@ -92,38 +92,29 @@ jobs:
 
           typedef void (^SKLogBlock)(NSString *line);
 
+          /// 监管与 MDM 状态的系统级落盘位置
           extern NSString *const SKConfigurationProfilesRoot;
           extern NSString *const SKDeviceManagementRoot;
           extern NSString *const SKUserProfilesRoot;
 
           @interface SKEngine : NSObject
 
+          /// 日志回调，可能在任意线程被调用，UI 层自行切主线程
           @property (nonatomic, copy, nullable) SKLogBlock logger;
 
+          /// 当前使用的 App Group（默认从签名 entitlements 自动读取）
           @property (nonatomic, readwrite, copy) NSString *appGroup;
 
           + (NSString *)configuredAppGroup;
           + (void)setConfiguredAppGroup:(NSString *)group;
 
+          /// 自检：系统版本、App Group、扩展可用性、当前监管状态
           - (NSString *)environmentReport;
 
-
-
-
+          /// 彻底清除监管 + MDM 落盘状态
           - (BOOL)wipeSupervision:(BOOL)aggressive error:(NSError **)error;
 
-          - (BOOL)patchSupervision:(NSError **)error;
-
-          - (BOOL)enableSupervisionWithOrganization:(NSString *)organization
-                                             email:(NSString *)email
-                                  configurationURL:(NSString *)url
-                                           withMDM:(BOOL)withMDM
-                                             error:(NSError **)error;
-
-
-
-
-
+          /// 释放所有已 consume 的扩展
           - (void)releaseAllExtensions;
 
           @end
@@ -449,165 +440,6 @@ jobs:
               return YES;
           }
 
-          #pragma mark - 温和补丁
-
-          - (BOOL)patchSupervision:(NSError **)error {
-              if (![self grantAccessTo:SKConfigurationProfilesRoot]) {
-                  if (error) {
-                      *error = [NSError errorWithDomain:@"SuperKill"
-                                                   code:2
-                                               userInfo:@{NSLocalizedDescriptionKey: @"拿不到 ConfigurationProfiles 扩展"}];
-                  }
-                  return NO;
-              }
-
-              BOOL changed = NO;
-
-              NSString *ccdPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"];
-              id ccdRaw = SKReadPlist(ccdPath);
-              NSMutableDictionary *ccd = [ccdRaw isKindOfClass:[NSDictionary class]] ? [ccdRaw mutableCopy] : nil;
-              if (ccd) {
-                  ccd[@"IsSupervised"] = @NO;
-                  ccd[@"IsMandatory"] = @NO;
-                  ccd[@"IsMDMUnremovable"] = @0;
-                  ccd[@"ConfigurationURL"] = @"https://127.0.0.1:1/";
-                  if (SKWritePlist(ccd, ccdPath)) {
-                      changed = YES;
-                      [self log:@"✓ CloudConfigurationDetails：IsSupervised / IsMandatory 已降为 false"];
-                  }
-              }
-
-              NSString *mdmPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDM.plist"];
-              id mdmRaw = SKReadPlist(mdmPath);
-              NSMutableDictionary *mdm = [mdmRaw isKindOfClass:[NSDictionary class]] ? [mdmRaw mutableCopy] : nil;
-              if (mdm) {
-                  mdm[@"ServerURL"] = @"https://127.0.0.1:1/";
-                  mdm[@"CheckInURL"] = @"https://127.0.0.1:1/";
-                  mdm[@"SignMessage"] = @NO;
-                  if (SKWritePlist(mdm, mdmPath)) {
-                      changed = YES;
-                      [self log:@"✓ MDM.plist：Server/CheckIn 已指向黑洞地址"];
-                  }
-              }
-
-              NSString *appMgmtPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDMAppManagement.plist"];
-              id appRaw = SKReadPlist(appMgmtPath);
-              NSMutableDictionary *appMgmt = [appRaw isKindOfClass:[NSDictionary class]] ? [appRaw mutableCopy] : nil;
-              if (appMgmt) {
-                  appMgmt[@"metadataByBundleID"] = @{};
-                  if (SKWritePlist(appMgmt, appMgmtPath)) {
-                      changed = YES;
-                      [self log:@"✓ MDMAppManagement：托管 App 清单已清空"];
-                  }
-              }
-
-              [self emptyPayloadManifestIn:SKConfigurationProfilesRoot];
-
-              if (!changed) {
-                  [self log:@"✗ 没有可改写的 plist（可能已经是干净的）"];
-              }
-              return changed;
-          }
-
-          #pragma mark - 开启监管（测试）
-
-          - (BOOL)enableSupervisionWithOrganization:(NSString *)organization
-                                             email:(NSString *)email
-                                  configurationURL:(NSString *)url
-                                           withMDM:(BOOL)withMDM
-                                             error:(NSError **)error {
-              if (![self grantAccessTo:SKConfigurationProfilesRoot]) {
-                  if (error) {
-                      *error = [NSError errorWithDomain:@"SuperKill"
-                                                   code:5
-                                               userInfo:@{NSLocalizedDescriptionKey: @"拿不到 ConfigurationProfiles 扩展"}];
-                  }
-                  return NO;
-              }
-
-              NSString *ccdPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"];
-              id existing = SKReadPlist(ccdPath);
-              NSMutableDictionary *ccd = [existing isKindOfClass:[NSDictionary class]]
-                  ? [existing mutableCopy]
-                  : [NSMutableDictionary dictionary];
-
-              // 与真实监管设备写入的键值保持一致，profiled / DeviceManagement 认这几个字段
-              ccd[@"IsSupervised"] = @YES;
-              ccd[@"IsMandatory"] = @YES;
-              ccd[@"IsMDMUnremovable"] = @1;
-              ccd[@"IsMultiUser"] = @NO;
-              ccd[@"ConfigurationWasApplied"] = @YES;
-              ccd[@"OrganizationName"] = organization.length ? organization : @"Test Organization";
-              ccd[@"ConfigurationURL"] = url.length ? url : @"https://mdm.invalid/profile";
-              ccd[@"LastModifiedTime"] = [NSDate date];
-              if (email.length) ccd[@"OrganizationEmail"] = email;
-
-              if (!SKWritePlist(ccd, ccdPath)) {
-                  if (error) {
-                      *error = [NSError errorWithDomain:@"SuperKill"
-                                                   code:6
-                                               userInfo:@{NSLocalizedDescriptionKey: @"CloudConfigurationDetails.plist 写入失败"}];
-                  }
-                  [self log:@"✗ 写入 CloudConfigurationDetails.plist 失败"];
-                  return NO;
-              }
-              [self log:@"✓ 已写入监管标记：IsSupervised = true，组织 = %@", ccd[@"OrganizationName"]];
-
-              if (withMDM) {
-                  NSString *mdmPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDM.plist"];
-                  id mdmRaw = SKReadPlist(mdmPath);
-                  NSMutableDictionary *mdm = [mdmRaw isKindOfClass:[NSDictionary class]]
-                      ? [mdmRaw mutableCopy]
-                      : [NSMutableDictionary dictionary];
-                  mdm[@"ServerURL"] = @"https://mdm.invalid/mdm";
-                  mdm[@"CheckInURL"] = @"https://mdm.invalid/checkin";
-                  mdm[@"Topic"] = @"com.apple.mgmt.External.test";
-                  mdm[@"SignMessage"] = @NO;
-                  if (SKWritePlist(mdm, mdmPath)) {
-                      [self log:@"✓ 已写入 MDM.plist 占位（无 APNs 证书，不会真的注册）"];
-                  } else {
-                      [self log:@"✗ MDM.plist 写入失败"];
-                  }
-              }
-
-              // 读回校验，确认落盘成功
-              NSDictionary *verify = SKReadPlist(ccdPath);
-              BOOL supervised = [verify[@"IsSupervised"] boolValue];
-              [self log:supervised ? @"✓ 读回校验通过：IsSupervised = true（重启后生效）"
-                                   : @"✗ 读回校验失败：IsSupervised 不是 true"];
-
-              // DeviceManagement 侧再镜像一份：部分版本优先读这里
-              [self mirrorCloudConfiguration:ccd];
-              return supervised;
-          }
-
-          - (void)mirrorCloudConfiguration:(NSDictionary *)cloud {
-              if (![self grantAccessTo:SKDeviceManagementRoot]) return;
-
-              NSString *mirrorPath = [SKDeviceManagementRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"];
-              if (SKWritePlist(cloud, mirrorPath)) {
-                  [self log:@"✓ DeviceManagement/CloudConfigurationDetails.plist 已镜像"];
-              }
-
-              NSString *truthPath = [SKDeviceManagementRoot stringByAppendingPathComponent:@"ClientTruth.plist"];
-              id truthRaw = SKReadPlist(truthPath);
-              if (![truthRaw isKindOfClass:[NSDictionary class]]) return;
-              NSMutableDictionary *truth = [truthRaw mutableCopy];
-
-              id entryRaw = truth[@"CloudConfiguration"];
-              NSMutableDictionary *entry = [entryRaw isKindOfClass:[NSDictionary class]]
-                  ? [entryRaw mutableCopy]
-                  : [NSMutableDictionary dictionary];
-              entry[@"IsSupervised"] = @YES;
-              entry[@"IsMandatory"] = @YES;
-              entry[@"OrganizationName"] = cloud[@"OrganizationName"] ?: @"Test Organization";
-              truth[@"CloudConfiguration"] = entry;
-              if (SKWritePlist(truth, truthPath)) {
-                  [self log:@"✓ ClientTruth.CloudConfiguration 已同步为受监管"];
-              }
-          }
-          #pragma mark - 回滚
-
           @end
           SK_EOF_04_SKENGINE_M
           mkdir -p Sources
@@ -629,25 +461,16 @@ jobs:
           //  SKMainViewController.m
           //  SuperKill
           //
-          //  操作台：App Group → 自检 → 开启 / 清除监管。
+          //  极简操作台：App Group → 自检 → 彻底清除。
           //
 
           #import "SKMainViewController.h"
           #import "SKEngine.h"
 
-          static NSString *const SKOrgKey = @"SKOrgName";
-          static NSString *const SKEmailKey = @"SKOrgEmail";
-          static NSString *const SKURLKey = @"SKConfigURL";
-          static NSString *const SKWithMDMKey = @"SKWithMDM";
-
           @interface SKMainViewController () <UITextFieldDelegate>
 
           @property (nonatomic, strong) SKEngine *engine;
           @property (nonatomic, strong) UITextField *groupField;
-          @property (nonatomic, strong) UITextField *orgField;
-          @property (nonatomic, strong) UITextField *emailField;
-          @property (nonatomic, strong) UITextField *urlField;
-          @property (nonatomic, strong) UISwitch *mdmSwitch;
           @property (nonatomic, strong) UITextView *console;
           @property (nonatomic, strong) UIActivityIndicatorView *spinner;
           @property (nonatomic, strong) NSMutableString *logBuffer;
@@ -661,7 +484,7 @@ jobs:
               [super viewDidLoad];
 
               NSString *displayName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"];
-              self.title = displayName.length ? displayName : @"智商清除";
+              self.title = displayName.length ? displayName : @"割韭菜最终版本";
               self.view.backgroundColor = [UIColor systemBackgroundColor];
 
               self.engine = [[SKEngine alloc] init];
@@ -676,9 +499,8 @@ jobs:
               };
 
               [self buildUI];
-              [self loadOptions];
-              [self appendLog:@"智商清除 ready：② 开启监管，③ 彻底清除，可来回切换。"];
-              [self appendLog:@"建议：执行前打开飞行模式，执行后保持断网并重启设备。"];
+              self.groupField.text = [SKEngine configuredAppGroup];
+              [self appendLog:@"就绪：① 自检看状态，② 彻底清除监管。"];
           }
 
           #pragma mark - UI
@@ -693,22 +515,8 @@ jobs:
               UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
               button.configuration = config;
               [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-              [button.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
+              [button.heightAnchor constraintGreaterThanOrEqualToConstant:48].active = YES;
               return button;
-          }
-
-          - (UITextField *)makeField:(NSString *)placeholder {
-              UITextField *field = [[UITextField alloc] init];
-              field.borderStyle = UITextBorderStyleRoundedRect;
-              field.placeholder = placeholder;
-              field.autocapitalizationType = UITextAutocapitalizationTypeNone;
-              field.autocorrectionType = UITextAutocorrectionTypeNo;
-              field.keyboardType = UIKeyboardTypeURL;
-              field.delegate = self;
-              field.returnKeyType = UIReturnKeyDone;
-              field.font = [UIFont systemFontOfSize:14];
-              [field.heightAnchor constraintEqualToConstant:40].active = YES;
-              return field;
           }
 
           - (UILabel *)makeSectionLabel:(NSString *)text {
@@ -728,74 +536,40 @@ jobs:
 
               UILayoutGuide *guide = self.view.safeAreaLayoutGuide;
               [NSLayoutConstraint activateConstraints:@[
-                  [root.topAnchor constraintEqualToAnchor:guide.topAnchor constant:12],
+                  [root.topAnchor constraintEqualToAnchor:guide.topAnchor constant:16],
                   [root.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor constant:16],
                   [root.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor constant:-16],
                   [root.bottomAnchor constraintEqualToAnchor:guide.bottomAnchor constant:-12],
               ]];
 
-              // 上半部分可滚动，小屏也不会被挤爆
-              UIScrollView *scroll = [[UIScrollView alloc] init];
-              scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
-              scroll.alwaysBounceVertical = YES;
-              scroll.translatesAutoresizingMaskIntoConstraints = NO;
-
-              UIStackView *controls = [[UIStackView alloc] init];
-              controls.axis = UILayoutConstraintAxisVertical;
-              controls.spacing = 8;
-              controls.translatesAutoresizingMaskIntoConstraints = NO;
-              [scroll addSubview:controls];
-              [NSLayoutConstraint activateConstraints:@[
-                  [controls.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
-                  [controls.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
-                  [controls.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor],
-                  [controls.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor],
-                  [controls.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor],
-              ]];
-
-              // App Group
               UIStackView *groupRow = [[UIStackView alloc] init];
               groupRow.axis = UILayoutConstraintAxisHorizontal;
               groupRow.spacing = 8;
-              self.groupField = [self makeField:@"group.cc.yourteam.superkill"];
+
+              self.groupField = [[UITextField alloc] init];
+              self.groupField.borderStyle = UITextBorderStyleRoundedRect;
+              self.groupField.placeholder = @"group.yourteam.superkill";
+              self.groupField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+              self.groupField.autocorrectionType = UITextAutocorrectionTypeNo;
+              self.groupField.delegate = self;
+              self.groupField.returnKeyType = UIReturnKeyDone;
+              self.groupField.font = [UIFont systemFontOfSize:14];
+              [self.groupField.heightAnchor constraintEqualToConstant:40].active = YES;
+
               UIButton *save = [self makeButton:@"保存" action:@selector(saveGroup) destructive:NO];
               [save.widthAnchor constraintEqualToConstant:72].active = YES;
+
               [groupRow addArrangedSubview:self.groupField];
               [groupRow addArrangedSubview:save];
 
-              [controls addArrangedSubview:[self makeSectionLabel:@"签名里的 App Group"]];
-              [controls addArrangedSubview:groupRow];
-              [controls addArrangedSubview:[self makeButton:@"① 自检（系统 / Group / 逃逸可用性）" action:@selector(runEnvironment) destructive:NO]];
-
-              // 开启监管参数
-              [controls addArrangedSubview:[self makeSectionLabel:@"开启监管（测试用）参数"]];
-              self.orgField = [self makeField:@"组织名，例如 Test Organization"];
-              self.emailField = [self makeField:@"组织邮箱（可空）"];
-              self.emailField.keyboardType = UIKeyboardTypeEmailAddress;
-              self.urlField = [self makeField:@"ConfigurationURL"];
-              [controls addArrangedSubview:self.orgField];
-              [controls addArrangedSubview:self.emailField];
-              [controls addArrangedSubview:self.urlField];
-
-              UIStackView *mdmRow = [[UIStackView alloc] init];
-              mdmRow.axis = UILayoutConstraintAxisHorizontal;
-              mdmRow.spacing = 8;
-              mdmRow.alignment = UIStackViewAlignmentCenter;
-              UILabel *mdmLabel = [self makeSectionLabel:@"同时写入 MDM.plist 占位"];
-              mdmLabel.textColor = [UIColor labelColor];
-              self.mdmSwitch = [[UISwitch alloc] init];
-              [mdmRow addArrangedSubview:mdmLabel];
-              [mdmRow addArrangedSubview:self.mdmSwitch];
-              [controls addArrangedSubview:mdmRow];
-
-              [controls addArrangedSubview:[self makeButton:@"② 开启监管（写入并校验）" action:@selector(confirmEnable) destructive:NO]];
-              [controls addArrangedSubview:[self makeButton:@"③ 彻底清除监管" action:@selector(confirmWipe) destructive:YES]];
-              [controls addArrangedSubview:[self makeButton:@"④ 温和补丁（保留 profile）" action:@selector(runPatch) destructive:NO]];
-              [controls addArrangedSubview:[self makeButton:@"释放全部扩展" action:@selector(runRelease) destructive:NO]];
+              [root addArrangedSubview:[self makeSectionLabel:@"App Group（App 会自动读签名里的，一般不用改）"]];
+              [root addArrangedSubview:groupRow];
+              [root addArrangedSubview:[self makeButton:@"① 自检（系统 / Group / 监管状态）" action:@selector(runEnvironment) destructive:NO]];
+              [root addArrangedSubview:[self makeButton:@"② 彻底清除监管" action:@selector(confirmWipe) destructive:YES]];
 
               self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
               self.spinner.hidesWhenStopped = YES;
-              [controls addArrangedSubview:self.spinner];
+              [root addArrangedSubview:self.spinner];
 
               self.console = [[UITextView alloc] init];
               self.console.editable = NO;
@@ -803,9 +577,7 @@ jobs:
               self.console.backgroundColor = [UIColor secondarySystemBackgroundColor];
               self.console.layer.cornerRadius = 8;
               self.console.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
-              [self.console.heightAnchor constraintEqualToConstant:190].active = YES;
-
-              [root addArrangedSubview:scroll];
+              [self.console.heightAnchor constraintGreaterThanOrEqualToConstant:260].active = YES;
               [root addArrangedSubview:self.console];
 
               UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dismissKeyboard)];
@@ -817,38 +589,11 @@ jobs:
               [self.view endEditing:YES];
           }
 
-          #pragma mark - 参数持久化
-
-          - (void)loadOptions {
-              NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-              self.groupField.text = [SKEngine configuredAppGroup];
-
-              NSString *org = [defaults stringForKey:SKOrgKey];
-              self.orgField.text = org.length ? org : @"Test Organization";
-
-              self.emailField.text = [defaults stringForKey:SKEmailKey] ?: @"";
-
-              NSString *url = [defaults stringForKey:SKURLKey];
-              self.urlField.text = url.length ? url : @"https://mdm.invalid/profile";
-
-              self.mdmSwitch.on = [defaults boolForKey:SKWithMDMKey];
-          }
-
-          - (void)persistOptions {
-              NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-              [defaults setObject:(self.orgField.text ?: @"") forKey:SKOrgKey];
-              [defaults setObject:(self.emailField.text ?: @"") forKey:SKEmailKey];
-              [defaults setObject:(self.urlField.text ?: @"") forKey:SKURLKey];
-              [defaults setBool:self.mdmSwitch.on forKey:SKWithMDMKey];
-              [defaults synchronize];
-          }
-
           - (void)saveGroup {
               [self.groupField resignFirstResponder];
               NSString *group = [self.groupField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
               [SKEngine setConfiguredAppGroup:group];
               self.engine.appGroup = group;
-              [self persistOptions];
               [self appendLog:[NSString stringWithFormat:@"App Group 已保存: %@", group.length ? group : @"(空)"]];
           }
 
@@ -898,25 +643,6 @@ jobs:
               [self presentViewController:alert animated:YES completion:nil];
           }
 
-          - (void)confirm:(NSString *)title
-                  message:(NSString *)message
-               actionName:(NSString *)actionName
-               destructive:(BOOL)destructive
-                  handler:(void (^)(void))handler {
-              UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
-                                                                            message:message
-                                                                     preferredStyle:UIAlertControllerStyleActionSheet];
-              [sheet addAction:[UIAlertAction actionWithTitle:actionName
-                                                        style:destructive ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
-                                                      handler:^(UIAlertAction *action) {
-                  handler();
-              }]];
-              [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-              sheet.popoverPresentationController.sourceView = self.view;
-              sheet.popoverPresentationController.sourceRect = self.view.bounds;
-              [self presentViewController:sheet animated:YES completion:nil];
-          }
-
           #pragma mark - Actions
 
           - (void)runEnvironment {
@@ -928,57 +654,19 @@ jobs:
               }];
           }
 
-          - (void)confirmEnable {
-              [self saveGroup];
-              [self persistOptions];
-
-              NSString *org = self.orgField.text.length ? self.orgField.text : @"Test Organization";
-              NSString *email = self.emailField.text ?: @"";
-              NSString *url = self.urlField.text.length ? self.urlField.text : @"https://mdm.invalid/profile";
-              BOOL withMDM = self.mdmSwitch.on;
-
-              NSString *message = [NSString stringWithFormat:
-                                   @"将写入 CloudConfigurationDetails.plist：\n"
-                                   @"IsSupervised = true\n组织 = %@\n邮箱 = %@\nURL = %@\n"
-                                   @"MDM.plist 占位 = %@\n\n重启后设置首页会显示“此 iPhone 受监管”。",
-                                   org, email.length ? email : @"(空)", url, withMDM ? @"写" : @"不写"];
-
-              [self confirm:@"开启监管（测试）"
-                    message:message
-                 actionName:@"写入并校验"
-                destructive:NO
-                    handler:^{
-                  [self performEnableWithOrganization:org email:email url:url withMDM:withMDM];
-              }];
-          }
-
-          - (void)performEnableWithOrganization:(NSString *)org
-                                          email:(NSString *)email
-                                            url:(NSString *)url
-                                        withMDM:(BOOL)withMDM {
-              [self runInBackground:^{
-                  NSError *error = nil;
-                  BOOL ok = [self.engine enableSupervisionWithOrganization:org
-                                                                    email:email
-                                                         configurationURL:url
-                                                                  withMDM:withMDM
-                                                                    error:&error];
-                  dispatch_async(dispatch_get_main_queue(), ^{
-                      [self alert:ok ? @"已开启（待重启生效）" : @"开启失败"
-                                  message:ok ? @"监管标记已落盘并读回校验通过。重启设备后：设置首页显示“此 iPhone 受监管”。想回到普通设备，点 ③ 彻底清除即可。"
-                                             : (error.localizedDescription ?: @"未知错误")];
-                  });
-              }];
-          }
-
           - (void)confirmWipe {
-              [self confirm:@"彻底清除监管"
-                    message:@"将删除 CloudConfigurationDetails.plist、MDM.plist、MDMEvents.plist、MDMAppManagement.plist、PayloadManifest 条目与全部 GUID.stub，并清空 DeviceManagement 下的状态。"
-                 actionName:@"继续（彻底）"
-                destructive:YES
-                    handler:^{
+              UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"彻底清除监管"
+                                                                            message:@"将删除 CloudConfigurationDetails.plist、MDM.plist、MDMEvents.plist、MDMAppManagement.plist、PayloadManifest 条目与全部 GUID.stub，并清空 DeviceManagement 下的状态。"
+                                                                     preferredStyle:UIAlertControllerStyleActionSheet];
+              [sheet addAction:[UIAlertAction actionWithTitle:@"继续（彻底）"
+                                                        style:UIAlertActionStyleDestructive
+                                                      handler:^(UIAlertAction *action) {
                   [self performWipe];
-              }];
+              }]];
+              [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+              sheet.popoverPresentationController.sourceView = self.view;
+              sheet.popoverPresentationController.sourceRect = self.view.bounds;
+              [self presentViewController:sheet animated:YES completion:nil];
           }
 
           - (void)performWipe {
@@ -990,25 +678,6 @@ jobs:
                                   message:ok ? @"保持飞行模式，重启设备后再联网验证：设置 → 通用 → VPN 与设备管理 中不应再有 MDM 描述文件，设置首页不应再显示“此 iPhone 受监管”。"
                                              : (error.localizedDescription ?: @"未知错误")];
                   });
-              }];
-          }
-
-          - (void)runPatch {
-              [self saveGroup];
-              [self runInBackground:^{
-                  NSError *error = nil;
-                  BOOL ok = [self.engine patchSupervision:&error];
-                  dispatch_async(dispatch_get_main_queue(), ^{
-                      if (!ok) {
-                          [self alert:@"补丁未生效" message:error.localizedDescription ?: @"没有可改写的字段"];
-                      }
-                  });
-              }];
-          }
-
-          - (void)runRelease {
-              [self runInBackground:^{
-                  [self.engine releaseAllExtensions];
               }];
           }
 
@@ -1247,7 +916,7 @@ jobs:
           	<key>CFBundleDevelopmentRegion</key>
           	<string>zh_CN</string>
           	<key>CFBundleDisplayName</key>
-          	<string>智商清除</string>
+          	<string>割韭菜最终版本</string>
           	<key>CFBundleExecutable</key>
           	<string>$(EXECUTABLE_NAME)</string>
           	<key>CFBundleIdentifier</key>
@@ -1365,7 +1034,7 @@ jobs:
           SK_EOF_11_PROJECT_YML
           python3 - <<'SK_ICON_B64'
           import base64, pathlib
-          data = """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"""
+          data = """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"""
           pathlib.Path("/tmp/sk_default_icon.png").write_bytes(base64.b64decode("".join(data.split())))
           SK_ICON_B64
           SRC=/tmp/sk_default_icon.png
