@@ -92,60 +92,38 @@ jobs:
 
           typedef void (^SKLogBlock)(NSString *line);
 
-          /// 监管与 MDM 状态的系统级落盘位置（iOS 13 - 27 通用）
           extern NSString *const SKConfigurationProfilesRoot;
           extern NSString *const SKDeviceManagementRoot;
           extern NSString *const SKUserProfilesRoot;
 
           @interface SKEngine : NSObject
 
-          /// 日志回调，可能在任意线程被调用，UI 层自行切主线程
           @property (nonatomic, copy, nullable) SKLogBlock logger;
 
-          /// 当前使用的 App Group（默认取 NSUserDefaults/Info.plist 的 SKAppGroup）
           @property (nonatomic, readwrite, copy) NSString *appGroup;
 
           + (NSString *)configuredAppGroup;
           + (void)setConfiguredAppGroup:(NSString *)group;
 
-          /// 环境自检：系统版本、App Group、容器可访问性
           - (NSString *)environmentReport;
 
-          /// 读取并汇报监管状态（组织名、IsSupervised、MDM ServerURL 等）
-          - (NSString *)inspectSupervision;
 
-          /// 最近一次检测到的 IsSupervised 值；未知返回 -1
-          - (NSInteger)supervisedState;
 
-          /// 备份三个根目录到 Documents/backups/<时间戳>/，返回备份目录路径
-          - (nullable NSString *)backup:(NSError **)error;
 
-          /// 彻底清除监管 + MDM 落盘状态（aggressive = 顺带清空所有 profile stub）
           - (BOOL)wipeSupervision:(BOOL)aggressive error:(NSError **)error;
 
-          /// 温和模式：原地改写 plist，字段降权但保留文件（适合只想摆脱限制、保留 profile 的场景）
           - (BOOL)patchSupervision:(NSError **)error;
 
-          /// 测试用反向操作：写入监管标记（IsSupervised / OrganizationName / ConfigurationURL 等），
-          /// 重启后设备会显示“此 iPhone 受监管”。withMDM 为真时同时写一份 MDM.plist 占位。
           - (BOOL)enableSupervisionWithOrganization:(NSString *)organization
                                              email:(NSString *)email
                                   configurationURL:(NSString *)url
                                            withMDM:(BOOL)withMDM
                                              error:(NSError **)error;
 
-          /// 用 Documents/backups 里最新一份备份覆盖回去
-          - (BOOL)restoreLatestBackup:(NSError **)error;
 
-          #pragma mark - 快照与对比
 
-          /// 记录当前状态快照（Documents/snapshots/<时间戳>-<label>.plist），返回一行摘要
-          - (NSString *)captureSnapshotWithLabel:(NSString *)label;
 
-          /// 对快照链逐对做 diff，最后再和“当前实时状态”比一次；结果同时输出到日志
-          - (NSString *)diffSnapshotChain;
 
-          /// 释放所有已 consume 的扩展
           - (void)releaseAllExtensions;
 
           @end
@@ -203,7 +181,6 @@ jobs:
 
           @interface SKEngine ()
           @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *handles;
-          @property (nonatomic, assign) NSInteger supervisedState;
 
           - (void)log:(NSString *)format, ... NS_FORMAT_FUNCTION(1, 2);
           - (BOOL)hasAccessTo:(NSString *)path;
@@ -212,24 +189,6 @@ jobs:
           - (NSArray<NSString *> *)entriesIn:(NSString *)root;
           - (BOOL)removeItem:(NSString *)path;
           - (void)emptyPayloadManifestIn:(NSString *)root;
-          - (NSString *)backupsRoot;
-          - (void)mirrorCloudConfiguration:(NSDictionary *)cloud;
-
-          - (NSString *)snapshotsRoot;
-          - (NSDictionary *)captureState;
-          - (NSDictionary *)describeEntriesIn:(NSString *)root;
-          - (NSDictionary *)subsetOf:(NSDictionary *)dict keys:(NSArray<NSString *> *)keys;
-          - (NSString *)summarizeState:(NSDictionary *)state;
-          - (NSString *)snapshotTitle:(NSDictionary *)snapshot;
-          - (NSString *)valueText:(id)value;
-          - (NSString *)diffFrom:(NSDictionary *)left to:(NSDictionary *)right;
-          - (void)appendEntriesDiffFrom:(NSDictionary *)left
-                                     to:(NSDictionary *)right
-                                   into:(NSMutableString *)out;
-          - (void)appendValuesDiffFrom:(NSDictionary *)left
-                                    to:(NSDictionary *)right
-                               section:(NSString *)section
-                                  into:(NSMutableString *)out;
           @end
 
           @implementation SKEngine
@@ -238,7 +197,6 @@ jobs:
               if ((self = [super init])) {
                   _handles = [NSMutableDictionary dictionary];
                   _appGroup = [SKEngine configuredAppGroup];
-                  _supervisedState = -1;
               }
               return self;
           }
@@ -354,7 +312,7 @@ jobs:
               [self.handles removeAllObjects];
           }
 
-          #pragma mark - 自检 / 检测
+          #pragma mark - 自检
 
           - (NSString *)environmentReport {
               NSMutableString *out = [NSMutableString string];
@@ -371,6 +329,24 @@ jobs:
               [out appendFormat:@"ConfigurationProfiles: %@\n", cfg ? @"扩展已取得（逃逸可用）" : @"扩展失败"];
               [out appendFormat:@"DeviceManagement: %@\n", dev ? @"扩展已取得" : @"不可用（未登记 MDM 时属正常）"];
               [out appendFormat:@"已持有句柄: %lu\n", (unsigned long)self.handles.count];
+
+              // 当前监管状态（原“检测”按钮已合并进自检）
+              if (cfg) {
+                  NSDictionary *cloud = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"]);
+                  if ([cloud isKindOfClass:[NSDictionary class]]) {
+                      BOOL supervised = [cloud[@"IsSupervised"] boolValue];
+                      [out appendFormat:@"监管: %@（IsSupervised = %d）· 组织 = %@\n",
+                       supervised ? @"受监管" : @"未监管", supervised, cloud[@"OrganizationName"] ?: @"(无)"];
+                  } else {
+                      [out appendString:@"监管: 未检测到监管标记\n"];
+                  }
+
+                  NSDictionary *mdm = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDM.plist"]);
+                  if ([mdm isKindOfClass:[NSDictionary class]]) {
+                      [out appendFormat:@"MDM: %@ · Topic = %@\n",
+                       mdm[@"ServerURL"] ?: @"(无)", mdm[@"Topic"] ?: @"(无)"];
+                  }
+              }
               return out;
           }
 
@@ -382,106 +358,6 @@ jobs:
                   return @[];
               }
               return list;
-          }
-
-          - (NSString *)inspectSupervision {
-              NSMutableString *out = [NSMutableString string];
-
-              if ([self grantAccessTo:SKConfigurationProfilesRoot]) {
-                  [out appendFormat:@"== %@ ==\n", SKConfigurationProfilesRoot.lastPathComponent];
-                  for (NSString *name in [self entriesIn:SKConfigurationProfilesRoot]) {
-                      [out appendFormat:@"  • %@\n", name];
-                  }
-
-                  NSString *ccdPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"];
-                  NSDictionary *ccd = SKReadPlist(ccdPath);
-                  if ([ccd isKindOfClass:[NSDictionary class]]) {
-                      id supervised = ccd[@"IsSupervised"];
-                      self.supervisedState = [supervised respondsToSelector:@selector(integerValue)] ? [supervised integerValue] : -1;
-                      [out appendFormat:@"\n监管: IsSupervised = %@\n", supervised ?: @"(缺省)"];
-                      [out appendFormat:@"组织: %@\n", ccd[@"OrganizationName"] ?: @"(无)"];
-                      [out appendFormat:@"IsMandatory = %@ / IsMDMUnremovable = %@\n",
-                          ccd[@"IsMandatory"] ?: @"(无)", ccd[@"IsMDMUnremovable"] ?: @"(无)"];
-                      [out appendFormat:@"ConfigurationURL: %@\n", ccd[@"ConfigurationURL"] ?: @"(无)"];
-                  } else {
-                      [out appendString:@"\n监管: 未找到 CloudConfigurationDetails.plist（可能已清除）\n"];
-                      self.supervisedState = 0;
-                  }
-
-                  NSDictionary *mdm = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDM.plist"]);
-                  if ([mdm isKindOfClass:[NSDictionary class]]) {
-                      [out appendFormat:@"\nMDM ServerURL: %@\n", mdm[@"ServerURL"] ?: @"(无)"];
-                      [out appendFormat:@"MDM CheckInURL: %@\n", mdm[@"CheckInURL"] ?: @"(无)"];
-                      [out appendFormat:@"MDM Topic: %@\n", mdm[@"Topic"] ?: @"(无)"];
-                  }
-              }
-
-              if ([self grantAccessTo:SKDeviceManagementRoot]) {
-                  [out appendFormat:@"\n== %@ ==\n", SKDeviceManagementRoot.lastPathComponent];
-                  for (NSString *name in [self entriesIn:SKDeviceManagementRoot]) {
-                      [out appendFormat:@"  • %@\n", name];
-                  }
-              }
-
-              if ([self grantAccessTo:SKUserProfilesRoot]) {
-                  [out appendFormat:@"\n== %@ ==\n", SKUserProfilesRoot.lastPathComponent];
-                  for (NSString *name in [self entriesIn:SKUserProfilesRoot]) {
-                      [out appendFormat:@"  • %@\n", name];
-                  }
-              }
-
-              [self log:@"%@", out];
-              return out;
-          }
-
-          #pragma mark - 备份
-
-          - (NSString *)backupsRoot {
-              NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-              return [documents stringByAppendingPathComponent:@"backups"];
-          }
-
-          - (NSString *)backup:(NSError **)error {
-              NSFileManager *fm = [NSFileManager defaultManager];
-              NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-              formatter.dateFormat = @"yyyyMMdd-HHmmss";
-              NSString *stamp = [formatter stringFromDate:[NSDate date]];
-
-              NSString *root = [self backupsRoot];
-              [fm createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:NULL];
-              NSString *dest = [root stringByAppendingPathComponent:stamp];
-              NSError *createError = nil;
-              if (![fm createDirectoryAtPath:dest withIntermediateDirectories:YES attributes:nil error:&createError]) {
-                  if (error) *error = createError;
-                  return nil;
-              }
-
-              NSArray<NSString *> *roots = @[SKConfigurationProfilesRoot, SKDeviceManagementRoot, SKUserProfilesRoot];
-              NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
-              NSInteger total = 0;
-
-              for (NSUInteger i = 0; i < roots.count; i++) {
-                  NSString *source = roots[i];
-                  if (![self grantAccessTo:source]) continue;
-
-                  NSString *slug = [NSString stringWithFormat:@"%lu-%@", (unsigned long)i, source.lastPathComponent];
-                  NSString *dst = [dest stringByAppendingPathComponent:slug];
-                  [fm createDirectoryAtPath:dst withIntermediateDirectories:YES attributes:nil error:NULL];
-
-                  NSInteger copied = 0;
-                  for (NSString *name in [self entriesIn:source]) {
-                      NSString *from = [source stringByAppendingPathComponent:name];
-                      NSString *to = [dst stringByAppendingPathComponent:name];
-                      if ([fm copyItemAtPath:from toPath:to error:NULL]) copied++;
-                  }
-                  map[slug] = source;
-                  total += copied;
-                  [self log:@"备份 %@ → %ld 项", source.lastPathComponent, (long)copied];
-              }
-
-              SKWritePlist(map, [dest stringByAppendingPathComponent:@"roots.plist"]);
-              [self log:@"✓ 备份完成（%ld 项）: %@", (long)total, dest];
-              return dest;
           }
 
           #pragma mark - 清除
@@ -730,354 +606,7 @@ jobs:
                   [self log:@"✓ ClientTruth.CloudConfiguration 已同步为受监管"];
               }
           }
-
-          #pragma mark - 快照与对比
-
-          static NSArray<NSString *> *SKCloudKeys(void) {
-              return @[@"IsSupervised", @"IsMandatory", @"IsMDMUnremovable", @"IsMultiUser",
-                       @"ConfigurationWasApplied", @"OrganizationName", @"OrganizationEmail",
-                       @"ConfigurationURL"];
-          }
-
-          static NSArray<NSString *> *SKMDMKeys(void) {
-              return @[@"ServerURL", @"CheckInURL", @"Topic", @"SignMessage"];
-          }
-
-          static NSArray<NSString *> *SKTruthKeys(void) {
-              return @[@"IsSupervised", @"IsMandatory", @"OrganizationName"];
-          }
-
-          - (NSString *)snapshotsRoot {
-              NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-              return [documents stringByAppendingPathComponent:@"snapshots"];
-          }
-
-          - (NSDictionary *)subsetOf:(NSDictionary *)dict keys:(NSArray<NSString *> *)keys {
-              NSMutableDictionary *out = [NSMutableDictionary dictionary];
-              if (![dict isKindOfClass:[NSDictionary class]]) return out;
-              for (NSString *key in keys) {
-                  id value = dict[key];
-                  if (value) out[key] = value;
-              }
-              return out;
-          }
-
-          - (NSDictionary *)describeEntriesIn:(NSString *)root {
-              NSFileManager *fm = [NSFileManager defaultManager];
-              NSMutableDictionary *out = [NSMutableDictionary dictionary];
-              for (NSString *name in [self entriesIn:root]) {
-                  NSString *path = [root stringByAppendingPathComponent:name];
-                  NSDictionary *attributes = [fm attributesOfItemAtPath:path error:NULL];
-                  NSMutableDictionary *meta = [NSMutableDictionary dictionary];
-                  meta[@"size"] = @([attributes[NSFileSize] unsignedLongLongValue]);
-                  meta[@"mtime"] = @((long long)[attributes[NSFileModificationDate] timeIntervalSince1970]);
-                  meta[@"dir"] = @([attributes[NSFileType] isEqualToString:NSFileTypeDirectory]);
-                  out[name] = meta;
-              }
-              return out;
-          }
-
-          - (NSDictionary *)captureState {
-              NSMutableDictionary *state = [NSMutableDictionary dictionary];
-              state[@"created"] = [NSDate date];
-
-              NSOperatingSystemVersion v = [NSProcessInfo processInfo].operatingSystemVersion;
-              state[@"os"] = [NSString stringWithFormat:@"%ld.%ld.%ld",
-                              (long)v.majorVersion, (long)v.minorVersion, (long)v.patchVersion];
-
-              NSMutableDictionary *roots = [NSMutableDictionary dictionary];
-
-              // 1) ConfigurationProfiles
-              NSMutableDictionary *cfg = [NSMutableDictionary dictionary];
-              BOOL cfgAvailable = [self grantAccessTo:SKConfigurationProfilesRoot];
-              cfg[@"available"] = @(cfgAvailable);
-              if (cfgAvailable) {
-                  cfg[@"entries"] = [self describeEntriesIn:SKConfigurationProfilesRoot];
-
-                  id cloud = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"]);
-                  if ([cloud isKindOfClass:[NSDictionary class]]) {
-                      cfg[@"cloud"] = [self subsetOf:cloud keys:SKCloudKeys()];
-                  }
-                  id mdm = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDM.plist"]);
-                  if ([mdm isKindOfClass:[NSDictionary class]]) {
-                      cfg[@"mdm"] = [self subsetOf:mdm keys:SKMDMKeys()];
-                  }
-                  id manifest = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"PayloadManifest.plist"]);
-                  if ([manifest isKindOfClass:[NSDictionary class]]) {
-                      id ordered = manifest[@"OrderedProfiles"];
-                      if ([ordered isKindOfClass:[NSArray class]]) cfg[@"orderedProfiles"] = @([ordered count]);
-                  }
-              }
-              roots[SKConfigurationProfilesRoot] = cfg;
-
-              // 2) DeviceManagement
-              NSMutableDictionary *dev = [NSMutableDictionary dictionary];
-              BOOL devAvailable = [self grantAccessTo:SKDeviceManagementRoot];
-              dev[@"available"] = @(devAvailable);
-              if (devAvailable) {
-                  dev[@"entries"] = [self describeEntriesIn:SKDeviceManagementRoot];
-
-                  id cloud = SKReadPlist([SKDeviceManagementRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"]);
-                  if ([cloud isKindOfClass:[NSDictionary class]]) {
-                      dev[@"cloud"] = [self subsetOf:cloud keys:SKCloudKeys()];
-                  }
-                  id truth = SKReadPlist([SKDeviceManagementRoot stringByAppendingPathComponent:@"ClientTruth.plist"]);
-                  if ([truth isKindOfClass:[NSDictionary class]]) {
-                      id entry = truth[@"CloudConfiguration"];
-                      if ([entry isKindOfClass:[NSDictionary class]]) {
-                          dev[@"clientTruth"] = [self subsetOf:entry keys:SKTruthKeys()];
-                      }
-                  }
-              }
-              roots[SKDeviceManagementRoot] = dev;
-
-              // 3) 用户级 profile 目录
-              NSMutableDictionary *usr = [NSMutableDictionary dictionary];
-              BOOL usrAvailable = [self grantAccessTo:SKUserProfilesRoot];
-              usr[@"available"] = @(usrAvailable);
-              if (usrAvailable) {
-                  usr[@"entries"] = [self describeEntriesIn:SKUserProfilesRoot];
-              }
-              roots[SKUserProfilesRoot] = usr;
-
-              state[@"roots"] = roots;
-              return state;
-          }
-
-          - (NSString *)summarizeState:(NSDictionary *)state {
-              NSDictionary *roots = state[@"roots"];
-              NSDictionary *cfg = roots[SKConfigurationProfilesRoot] ?: @{};
-              NSDictionary *cloud = cfg[@"cloud"] ?: @{};
-              NSDictionary *mdm = cfg[@"mdm"] ?: @{};
-
-              return [NSString stringWithFormat:@"iOS %@ · ConfigurationProfiles %lu 项 · IsSupervised=%@ · 组织=%@ · MDM=%@",
-                      state[@"os"] ?: @"?",
-                      (unsigned long)[cfg[@"entries"] count],
-                      cloud[@"IsSupervised"] ?: @"(无)",
-                      cloud[@"OrganizationName"] ?: @"(无)",
-                      mdm[@"ServerURL"] ?: @"(无)"];
-          }
-
-          - (NSString *)captureSnapshotWithLabel:(NSString *)label {
-              NSMutableDictionary *state = [[self captureState] mutableCopy];
-              NSString *text = label.length ? label : @"snapshot";
-              state[@"label"] = text;
-
-              NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-              formatter.dateFormat = @"yyyyMMdd-HHmmss";
-              NSString *stamp = [formatter stringFromDate:[NSDate date]];
-
-              NSCharacterSet *unsafe = [NSCharacterSet characterSetWithCharactersInString:@"/\\: "];
-              NSString *safe = [[text componentsSeparatedByCharactersInSet:unsafe] componentsJoinedByString:@"_"];
-              NSString *name = [NSString stringWithFormat:@"%@-%@.plist", stamp, safe];
-
-              NSString *dir = [self snapshotsRoot];
-              [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                        withIntermediateDirectories:YES
-                                                         attributes:nil
-                                                              error:NULL];
-              BOOL ok = SKWritePlist(state, [dir stringByAppendingPathComponent:name]);
-
-              NSString *summary = [self summarizeState:state];
-              [self log:@"📸 %@ %@：%@", ok ? @"快照已保存" : @"快照写入失败", name, summary];
-              return summary;
-          }
-
-          - (NSString *)snapshotTitle:(NSDictionary *)snapshot {
-              NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-              formatter.dateFormat = @"MM-dd HH:mm:ss";
-              NSDate *date = snapshot[@"created"];
-              NSString *when = [date isKindOfClass:[NSDate class]] ? [formatter stringFromDate:date] : @"?";
-              return [NSString stringWithFormat:@"%@ @ %@", snapshot[@"label"] ?: @"snapshot", when];
-          }
-
-          - (NSString *)valueText:(id)value {
-              if (!value) return @"(无)";
-              NSString *text = [value description];
-              if (text.length > 60) {
-                  text = [[text substringToIndex:60] stringByAppendingString:@"…"];
-              }
-              return text;
-          }
-
-          - (void)appendEntriesDiffFrom:(NSDictionary *)left
-                                     to:(NSDictionary *)right
-                                   into:(NSMutableString *)out {
-              NSDictionary *l = left ?: @{};
-              NSDictionary *r = right ?: @{};
-
-              NSMutableSet *names = [NSMutableSet setWithArray:l.allKeys];
-              [names addObjectsFromArray:r.allKeys];
-              NSArray *sorted = [names.allObjects sortedArrayUsingSelector:@selector(compare:)];
-
-              NSMutableArray<NSString *> *lines = [NSMutableArray array];
-              for (NSString *name in sorted) {
-                  NSDictionary *lm = l[name];
-                  NSDictionary *rm = r[name];
-                  if (!lm && rm) {
-                      [lines addObject:[NSString stringWithFormat:@"  + %@ (%@ B)", name, rm[@"size"] ?: @"?"]];
-                  } else if (lm && !rm) {
-                      [lines addObject:[NSString stringWithFormat:@"  − %@ (%@ B)", name, lm[@"size"] ?: @"?"]];
-                  } else if (![lm[@"size"] isEqual:rm[@"size"]]) {
-                      [lines addObject:[NSString stringWithFormat:@"  ~ %@ 大小 %@ → %@ B",
-                                        name, lm[@"size"] ?: @"?", rm[@"size"] ?: @"?"]];
-                  }
-              }
-
-              if (lines.count == 0) {
-                  [out appendString:@"  目录结构无变化\n"];
-              } else {
-                  [out appendFormat:@"%@\n", [lines componentsJoinedByString:@"\n"]];
-              }
-          }
-
-          - (void)appendValuesDiffFrom:(NSDictionary *)left
-                                    to:(NSDictionary *)right
-                               section:(NSString *)section
-                                  into:(NSMutableString *)out {
-              NSDictionary *l = [left isKindOfClass:[NSDictionary class]] ? left : nil;
-              NSDictionary *r = [right isKindOfClass:[NSDictionary class]] ? right : nil;
-              if (!l && !r) return;
-
-              NSMutableSet *keys = [NSMutableSet setWithArray:(l.allKeys ?: @[])];
-              [keys addObjectsFromArray:(r.allKeys ?: @[])];
-
-              NSArray *sorted = [keys.allObjects sortedArrayUsingSelector:@selector(compare:)];
-              for (NSString *key in sorted) {
-                  id lv = l[key];
-                  id rv = r[key];
-                  if ([lv isEqual:rv]) continue;
-                  [out appendFormat:@"  %@.%@: %@ → %@\n", section, key, [self valueText:lv], [self valueText:rv]];
-              }
-          }
-
-          - (NSString *)diffFrom:(NSDictionary *)left to:(NSDictionary *)right {
-              NSMutableString *out = [NSMutableString string];
-              [out appendFormat:@"\n=== %@  →  %@ ===\n", [self snapshotTitle:left], [self snapshotTitle:right]];
-
-              NSDictionary *leftRoots = left[@"roots"] ?: @{};
-              NSDictionary *rightRoots = right[@"roots"] ?: @{};
-
-              id lSup = leftRoots[SKConfigurationProfilesRoot][@"cloud"][@"IsSupervised"];
-              id rSup = rightRoots[SKConfigurationProfilesRoot][@"cloud"][@"IsSupervised"];
-              [out appendFormat:@"监管: %@ → %@\n", [self valueText:lSup], [self valueText:rSup]];
-
-              NSArray<NSString *> *roots = @[SKConfigurationProfilesRoot, SKDeviceManagementRoot, SKUserProfilesRoot];
-              for (NSString *root in roots) {
-                  NSDictionary *l = leftRoots[root];
-                  NSDictionary *r = rightRoots[root];
-                  if (!l && !r) continue;
-
-                  [out appendFormat:@"\n[%@]\n", root.lastPathComponent];
-
-                  if (!l || !r) {
-                      [out appendString:@"  只有一侧存在快照，跳过\n"];
-                      continue;
-                  }
-
-                  BOOL lAvailable = [l[@"available"] boolValue];
-                  BOOL rAvailable = [r[@"available"] boolValue];
-                  if (lAvailable != rAvailable) {
-                      [out appendFormat:@"  可用性: %@ → %@\n",
-                       lAvailable ? @"可读写" : @"不可用", rAvailable ? @"可读写" : @"不可用"];
-                  }
-
-                  [self appendEntriesDiffFrom:l[@"entries"] to:r[@"entries"] into:out];
-
-                  for (NSString *section in @[@"cloud", @"mdm", @"clientTruth"]) {
-                      [self appendValuesDiffFrom:l[section] to:r[section] section:section into:out];
-                  }
-
-                  id lOrdered = l[@"orderedProfiles"];
-                  id rOrdered = r[@"orderedProfiles"];
-                  if (![lOrdered isEqual:rOrdered]) {
-                      [out appendFormat:@"  orderedProfiles: %@ → %@\n",
-                       lOrdered ?: @"(无)", rOrdered ?: @"(无)"];
-                  }
-              }
-
-              return out;
-          }
-
-          - (NSString *)diffSnapshotChain {
-              NSFileManager *fm = [NSFileManager defaultManager];
-              NSString *dir = [self snapshotsRoot];
-              [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
-
-              NSArray<NSString *> *names = [[fm contentsOfDirectoryAtPath:dir error:NULL]
-                                            sortedArrayUsingSelector:@selector(compare:)];
-              NSMutableArray<NSDictionary *> *snapshots = [NSMutableArray array];
-              for (NSString *name in names) {
-                  if (![name.pathExtension isEqualToString:@"plist"]) continue;
-                  id snapshot = SKReadPlist([dir stringByAppendingPathComponent:name]);
-                  if ([snapshot isKindOfClass:[NSDictionary class]]) [snapshots addObject:snapshot];
-              }
-
-              if (snapshots.count == 0) {
-                  [self log:@"还没有快照：先点 ⑧ 记录一份基线"];
-                  return @"";
-              }
-
-              NSMutableDictionary *current = [[self captureState] mutableCopy];
-              current[@"label"] = @"当前";
-
-              NSMutableString *out = [NSMutableString string];
-              for (NSUInteger i = 1; i < snapshots.count; i++) {
-                  [out appendString:[self diffFrom:snapshots[i - 1] to:snapshots[i]]];
-              }
-              [out appendString:[self diffFrom:snapshots.lastObject to:current]];
-
-              [out insertString:[NSString stringWithFormat:@"共 %lu 份快照，逐对比较 + 最新快照 vs 当前\n",
-                                 (unsigned long)snapshots.count]
-                        atIndex:0];
-              [self log:@"%@", out];
-              return out;
-          }
-
           #pragma mark - 回滚
-
-          - (BOOL)restoreLatestBackup:(NSError **)error {
-              NSFileManager *fm = [NSFileManager defaultManager];
-              NSArray<NSString *> *dirs = [fm contentsOfDirectoryAtPath:[self backupsRoot] error:NULL];
-              NSString *latest = [dirs sortedArrayUsingSelector:@selector(compare:)].lastObject;
-              if (latest.length == 0) {
-                  if (error) {
-                      *error = [NSError errorWithDomain:@"SuperKill"
-                                                   code:3
-                                               userInfo:@{NSLocalizedDescriptionKey: @"没有可用备份"}];
-                  }
-                  return NO;
-              }
-
-              NSString *dir = [[self backupsRoot] stringByAppendingPathComponent:latest];
-              NSDictionary<NSString *, NSString *> *map = SKReadPlist([dir stringByAppendingPathComponent:@"roots.plist"]);
-              if (![map isKindOfClass:[NSDictionary class]] || map.count == 0) {
-                  if (error) {
-                      *error = [NSError errorWithDomain:@"SuperKill"
-                                                   code:4
-                                               userInfo:@{NSLocalizedDescriptionKey: @"备份清单损坏"}];
-                  }
-                  return NO;
-              }
-
-              NSInteger restored = 0;
-              for (NSString *slug in map) {
-                  NSString *target = map[slug];
-                  if (![self grantAccessTo:target]) continue;
-                  NSString *src = [dir stringByAppendingPathComponent:slug];
-                  for (NSString *name in [fm contentsOfDirectoryAtPath:src error:NULL]) {
-                      if ([name isEqualToString:@"roots.plist"]) continue;
-                      NSString *from = [src stringByAppendingPathComponent:name];
-                      NSString *to = [target stringByAppendingPathComponent:name];
-                      [fm removeItemAtPath:to error:NULL];
-                      if ([fm copyItemAtPath:from toPath:to error:NULL]) restored++;
-                  }
-                  [self log:@"↺ 已还原 %@", target.lastPathComponent];
-              }
-
-              [self log:@"✓ 回滚完成（%ld 项）：%@", (long)restored, latest];
-              return restored > 0;
-          }
 
           @end
           SK_EOF_04_SKENGINE_M
@@ -1100,7 +629,7 @@ jobs:
           //  SKMainViewController.m
           //  SuperKill
           //
-          //  操作台：App Group → 自检 → 检测 → 备份 → 开启/清除监管 → 回滚。
+          //  操作台：App Group → 自检 → 开启 / 清除监管。
           //
 
           #import "SKMainViewController.h"
@@ -1148,7 +677,7 @@ jobs:
 
               [self buildUI];
               [self loadOptions];
-              [self appendLog:@"SuperKill ready：④ 清除监管，⑦ 开启监管，可来回切换做测试。"];
+              [self appendLog:@"智商清除 ready：② 开启监管，③ 彻底清除，可来回切换。"];
               [self appendLog:@"建议：执行前打开飞行模式，执行后保持断网并重启设备。"];
           }
 
@@ -1237,9 +766,6 @@ jobs:
               [controls addArrangedSubview:[self makeSectionLabel:@"签名里的 App Group"]];
               [controls addArrangedSubview:groupRow];
               [controls addArrangedSubview:[self makeButton:@"① 自检（系统 / Group / 逃逸可用性）" action:@selector(runEnvironment) destructive:NO]];
-              [controls addArrangedSubview:[self makeButton:@"② 检测监管状态" action:@selector(runInspect) destructive:NO]];
-              [controls addArrangedSubview:[self makeButton:@"③ 备份配置目录" action:@selector(runBackup) destructive:NO]];
-              [controls addArrangedSubview:[self makeButton:@"⑧ 记录状态快照（基线 / 开启后 / 清除后）" action:@selector(promptSnapshot) destructive:NO]];
 
               // 开启监管参数
               [controls addArrangedSubview:[self makeSectionLabel:@"开启监管（测试用）参数"]];
@@ -1262,11 +788,9 @@ jobs:
               [mdmRow addArrangedSubview:self.mdmSwitch];
               [controls addArrangedSubview:mdmRow];
 
-              [controls addArrangedSubview:[self makeButton:@"⑦ 开启监管（写入并校验）" action:@selector(confirmEnable) destructive:NO]];
-              [controls addArrangedSubview:[self makeButton:@"④ 彻底清除监管" action:@selector(confirmWipe) destructive:YES]];
-              [controls addArrangedSubview:[self makeButton:@"⑤ 温和补丁（保留 profile）" action:@selector(runPatch) destructive:NO]];
-              [controls addArrangedSubview:[self makeButton:@"⑨ 对比快照链（含当前状态）" action:@selector(runDiff) destructive:NO]];
-              [controls addArrangedSubview:[self makeButton:@"⑥ 回滚最新备份" action:@selector(confirmRestore) destructive:NO]];
+              [controls addArrangedSubview:[self makeButton:@"② 开启监管（写入并校验）" action:@selector(confirmEnable) destructive:NO]];
+              [controls addArrangedSubview:[self makeButton:@"③ 彻底清除监管" action:@selector(confirmWipe) destructive:YES]];
+              [controls addArrangedSubview:[self makeButton:@"④ 温和补丁（保留 profile）" action:@selector(runPatch) destructive:NO]];
               [controls addArrangedSubview:[self makeButton:@"释放全部扩展" action:@selector(runRelease) destructive:NO]];
 
               self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
@@ -1404,61 +928,6 @@ jobs:
               }];
           }
 
-          - (void)runInspect {
-              [self saveGroup];
-              [self runInBackground:^{
-                  [self.engine inspectSupervision];
-                  NSInteger state = [self.engine supervisedState];
-                  dispatch_async(dispatch_get_main_queue(), ^{
-                      NSString *text = state > 0 ? @"设备处于监管状态（IsSupervised = true）"
-                                                : (state == 0 ? @"未检测到监管标记" : @"无法判定");
-                      [self appendLog:text];
-                  });
-              }];
-          }
-
-          - (void)runBackup {
-              [self saveGroup];
-              [self runInBackground:^{
-                  NSError *error = nil;
-                  NSString *path = [self.engine backup:&error];
-                  if (!path) {
-                      dispatch_async(dispatch_get_main_queue(), ^{
-                          [self alert:@"备份失败" message:error.localizedDescription ?: @"未知错误"];
-                      });
-                  }
-              }];
-          }
-
-          - (void)promptSnapshot {
-              UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"记录状态快照"
-                                                                             message:@"给这次快照起名，diff 里会用它做标题（基线 / 开启后 / 清除后 …）"
-                                                                      preferredStyle:UIAlertControllerStyleAlert];
-              [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-                  textField.placeholder = @"基线";
-                  textField.text = @"基线";
-                  textField.autocorrectionType = UITextAutocorrectionTypeNo;
-              }];
-              [alert addAction:[UIAlertAction actionWithTitle:@"记录"
-                                                        style:UIAlertActionStyleDefault
-                                                      handler:^(UIAlertAction *action) {
-                  NSString *label = alert.textFields.firstObject.text;
-                  [self saveGroup];
-                  [self runInBackground:^{
-                      [self.engine captureSnapshotWithLabel:label];
-                  }];
-              }]];
-              [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-              [self presentViewController:alert animated:YES completion:nil];
-          }
-
-          - (void)runDiff {
-              [self saveGroup];
-              [self runInBackground:^{
-                  [self.engine diffSnapshotChain];
-              }];
-          }
-
           - (void)confirmEnable {
               [self saveGroup];
               [self persistOptions];
@@ -1496,7 +965,7 @@ jobs:
                                                                     error:&error];
                   dispatch_async(dispatch_get_main_queue(), ^{
                       [self alert:ok ? @"已开启（待重启生效）" : @"开启失败"
-                                  message:ok ? @"监管标记已落盘并读回校验通过。重启设备后：设置首页显示“此 iPhone 受监管”，② 检测会显示 IsSupervised = 1。之后可用 ④ 彻底清除来回切。"
+                                  message:ok ? @"监管标记已落盘并读回校验通过。重启设备后：设置首页显示“此 iPhone 受监管”。想回到普通设备，点 ③ 彻底清除即可。"
                                              : (error.localizedDescription ?: @"未知错误")];
                   });
               }];
@@ -1504,7 +973,7 @@ jobs:
 
           - (void)confirmWipe {
               [self confirm:@"彻底清除监管"
-                    message:@"将删除 CloudConfigurationDetails.plist、MDM.plist、MDMEvents.plist、MDMAppManagement.plist、PayloadManifest 条目与全部 GUID.stub，并清空 DeviceManagement 下的状态。建议先做 ③ 备份。"
+                    message:@"将删除 CloudConfigurationDetails.plist、MDM.plist、MDMEvents.plist、MDMAppManagement.plist、PayloadManifest 条目与全部 GUID.stub，并清空 DeviceManagement 下的状态。"
                  actionName:@"继续（彻底）"
                 destructive:YES
                     handler:^{
@@ -1534,22 +1003,6 @@ jobs:
                           [self alert:@"补丁未生效" message:error.localizedDescription ?: @"没有可改写的字段"];
                       }
                   });
-              }];
-          }
-
-          - (void)confirmRestore {
-              [self confirm:@"回滚"
-                    message:@"用最新一份备份覆盖当前配置目录。"
-                 actionName:@"回滚"
-                destructive:YES
-                    handler:^{
-                  [self runInBackground:^{
-                      NSError *error = nil;
-                      BOOL ok = [self.engine restoreLatestBackup:&error];
-                      dispatch_async(dispatch_get_main_queue(), ^{
-                          if (!ok) [self alert:@"回滚失败" message:error.localizedDescription ?: @"未知错误"];
-                      });
-                  }];
               }];
           }
 
