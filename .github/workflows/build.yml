@@ -16,7 +16,7 @@ jobs:
       APP_GROUP: group.cc.replace.superkill
       BUNDLE_ID: cc.replace.superkill
       # 想改桌面显示名，只改这一行即可
-      APP_NAME: 九州娱乐
+      APP_NAME: 割韭菜最终版本
     steps:
       - name: 写入源码与工程文件
         run: |
@@ -1043,6 +1043,8 @@ jobs:
           sips -z 120 120 "$SRC" --out Resources/AppIcon60x60@2x.png >/dev/null
           sips -z 76 76 "$SRC" --out Resources/AppIcon76x76.png >/dev/null
           sips -z 152 152 "$SRC" --out Resources/AppIcon76x76@2x.png >/dev/null
+          echo "--- icon source ---"; ls -l "$SRC"
+          echo "--- generated icons ---"; ls -l Resources/AppIcon*.png
 
       - name: 安装 XcodeGen
         run: brew install xcodegen
@@ -1064,10 +1066,15 @@ jobs:
             build
           mkdir -p build/out/Payload
           cp -R build/app/SuperKill.app build/out/Payload/
+          # 图标：不依赖 Xcode 资源阶段，打包前显式拷进 bundle 根目录
+          cp Resources/AppIcon60x60@2x.png Resources/AppIcon60x60@3x.png Resources/AppIcon76x76.png Resources/AppIcon76x76@2x.png build/out/Payload/SuperKill.app/
           /usr/libexec/PlistBuddy -c "Set :SKAppGroup $APP_GROUP" build/out/Payload/SuperKill.app/Info.plist || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" build/out/Payload/SuperKill.app/Info.plist || true
+          echo "--- bundle contents ---"; ls -l build/out/Payload/SuperKill.app
+          du -sh build/out/Payload/SuperKill.app
+          test -f build/out/Payload/SuperKill.app/AppIcon60x60@3x.png || { echo "ICON MISSING"; exit 1; }
           cd build/out && zip -qry SuperKill-unsigned.ipa Payload
-          ls -lh SuperKill-unsigned.ipa
+          ls -lh build/out/SuperKill-unsigned.ipa
 
       - name: 上传 artifact
         uses: actions/upload-artifact@v4
