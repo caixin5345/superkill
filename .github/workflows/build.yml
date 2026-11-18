@@ -1074,7 +1074,7 @@ jobs:
           du -sh build/out/Payload/SuperKill.app
           test -f build/out/Payload/SuperKill.app/AppIcon60x60@3x.png || { echo "ICON MISSING"; exit 1; }
           cd build/out && zip -qry SuperKill-unsigned.ipa Payload
-          ls -lh build/out/SuperKill-unsigned.ipa
+          ls -lh SuperKill-unsigned.ipa
 
       - name: 上传 artifact
         uses: actions/upload-artifact@v4
