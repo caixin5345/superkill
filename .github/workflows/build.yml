@@ -16,7 +16,7 @@ jobs:
       APP_GROUP: group.cc.replace.superkill
       BUNDLE_ID: cc.replace.superkill
       # 想改桌面显示名，只改这一行即可
-      APP_NAME: 九州博彩
+      APP_NAME: 割韭菜最终版本
     steps:
       - name: 写入源码与工程文件
         run: |
@@ -1038,13 +1038,32 @@ jobs:
           pathlib.Path("/tmp/sk_default_icon.png").write_bytes(base64.b64decode("".join(data.split())))
           SK_ICON_B64
           SRC=/tmp/sk_default_icon.png
-          if [ -f icon.png ]; then SRC=icon.png; echo "[*] 使用仓库根目录的 icon.png"; fi
+          echo "--- workspace icon.png ---"
+          ls -l icon.png 2>/dev/null || echo "workspace 里没有 icon.png"
+          ICON_MIN=20000
+          if [ -f icon.png ] && [ "$(stat -f%z icon.png)" -gt "$ICON_MIN" ]; then
+            SRC=icon.png
+            echo "[*] 使用仓库根目录的 icon.png"
+          else
+            echo "[*] 本地没找到可用的 icon.png，改为从 raw.githubusercontent 拉取"
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/icon.png" -o icon.png || true
+            if [ -f icon.png ] && [ "$(stat -f%z icon.png)" -gt "$ICON_MIN" ]; then
+              SRC=icon.png
+              echo "[*] 下载成功，使用远端 icon.png"
+            fi
+          fi
           sips -z 180 180 "$SRC" --out Resources/AppIcon60x60@3x.png >/dev/null
           sips -z 120 120 "$SRC" --out Resources/AppIcon60x60@2x.png >/dev/null
           sips -z 76 76 "$SRC" --out Resources/AppIcon76x76.png >/dev/null
           sips -z 152 152 "$SRC" --out Resources/AppIcon76x76@2x.png >/dev/null
           echo "--- icon source ---"; ls -l "$SRC"
           echo "--- generated icons ---"; ls -l Resources/AppIcon*.png
+          ICON_BYTES=$(stat -f%z Resources/AppIcon60x60@3x.png)
+          echo "180px icon = ${ICON_BYTES} bytes"
+          if [ "$ICON_BYTES" -lt "$ICON_MIN" ]; then
+            echo "::error::图标回退到了内置默认图（${ICON_BYTES} 字节），icon.png 没被用上"
+            exit 1
+          fi
 
       - name: 安装 XcodeGen
         run: brew install xcodegen
@@ -1073,8 +1092,8 @@ jobs:
           echo "--- bundle contents ---"; ls -l build/out/Payload/SuperKill.app
           du -sh build/out/Payload/SuperKill.app
           test -f build/out/Payload/SuperKill.app/AppIcon60x60@3x.png || { echo "ICON MISSING"; exit 1; }
-          cd build/out && zip -qry SuperKill-unsigned.ipa Payload
-          ls -lh SuperKill-unsigned.ipa
+          (cd build/out && zip -qry SuperKill-unsigned.ipa Payload)
+          ls -lh build/out/SuperKill-unsigned.ipa
 
       - name: 上传 artifact
         uses: actions/upload-artifact@v4
