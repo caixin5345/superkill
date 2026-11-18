@@ -16,7 +16,7 @@ jobs:
       APP_GROUP: group.cc.replace.superkill
       BUNDLE_ID: cc.replace.superkill
       # 想改桌面显示名，只改这一行即可
-      APP_NAME: 割韭菜最终版本
+      APP_NAME: 九州娱乐
     steps:
       - name: 写入源码与工程文件
         run: |
