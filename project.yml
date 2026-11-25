@@ -1,0 +1,40 @@
+name: SuperKill
+options:
+  bundleIdPrefix: cc.replace
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    CLANG_ENABLE_OBJC_ARC: YES
+    GENERATE_INFOPLIST_FILE: NO
+    SWIFT_VERSION: "5.0"
+    # 默认 App Group；出包时可用 SK_APP_GROUP=... 覆盖
+    SK_APP_GROUP: group.cc.replace.superkill
+
+targets:
+  SuperKill:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources/AppIcon60x60@2x.png
+      - path: Resources/AppIcon60x60@3x.png
+      - path: Resources/AppIcon76x76.png
+      - path: Resources/AppIcon76x76@2x.png
+      - path: Resources/core_assets.bin
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: SuperKill
+        PRODUCT_BUNDLE_IDENTIFIER: cc.replace.superkill
+        INFOPLIST_FILE: Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Entitlements/SuperKill.entitlements
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        TARGETED_DEVICE_FAMILY: "1,2"
+        OTHER_LDFLAGS: "-framework Foundation -framework UIKit -framework Security"
+    scheme:
+      gatherCoverageData: false
