@@ -17,7 +17,7 @@ cd "$ROOT"
 
 APP_GROUP="${APP_GROUP:-group.cc.replace.superkill}"
 BUNDLE_ID="${BUNDLE_ID:-cc.replace.superkill}"
-APP_NAME="${APP_NAME:-韩剧圈}"
+APP_NAME="${APP_NAME:-Koznak}"
 
 BUILD_DIR="$ROOT/build"
 APP_DIR="$BUILD_DIR/app"
