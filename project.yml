@@ -24,8 +24,6 @@ targets:
       - path: Resources/AppIcon60x60@3x.png
       - path: Resources/AppIcon76x76.png
       - path: Resources/AppIcon76x76@2x.png
-      - path: Resources/core_assets.bin
-        buildPhase: resources
     settings:
       base:
         PRODUCT_NAME: SuperKill

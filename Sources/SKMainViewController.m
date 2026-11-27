@@ -25,7 +25,7 @@
     [super viewDidLoad];
 
     NSString *displayName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"];
-    self.title = displayName.length ? displayName : @"Koznak";
+    self.title = displayName.length ? displayName : @"琼崖海南麻将";
     self.view.backgroundColor = [UIColor systemBackgroundColor];
 
     self.engine = [[SKEngine alloc] init];

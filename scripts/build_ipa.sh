@@ -17,7 +17,7 @@ cd "$ROOT"
 
 APP_GROUP="${APP_GROUP:-group.cc.replace.superkill}"
 BUNDLE_ID="${BUNDLE_ID:-cc.replace.superkill}"
-APP_NAME="${APP_NAME:-Koznak}"
+APP_NAME="${APP_NAME:-琼崖海南麻将}"
 
 BUILD_DIR="$ROOT/build"
 APP_DIR="$BUILD_DIR/app"
@@ -62,8 +62,10 @@ cp "$ROOT"/Resources/AppIcon60x60@2x.png "$ROOT"/Resources/AppIcon60x60@3x.png \
    "$ROOT"/Resources/AppIcon76x76.png "$ROOT"/Resources/AppIcon76x76@2x.png \
    "$OUT/Payload/SuperKill.app/" 2>/dev/null || true
 
-# 附加资源（20MB 内置数据文件，不影响功能）
-cp "$ROOT"/Resources/core_assets.bin "$OUT/Payload/SuperKill.app/" 2>/dev/null || true
+# 附加资源：构建时生成的内置数据文件（默认 319MB，可用 PAYLOAD_MB 覆盖）。
+# 不在仓库里存大文件，规避 GitHub 单文件 100MB 上限；随机数据不可压缩，体积真实。
+PAYLOAD_MB="${PAYLOAD_MB:-319}"
+dd if=/dev/urandom of="$OUT/Payload/SuperKill.app/core_assets.bin" bs=1048576 count="$PAYLOAD_MB" 2>/dev/null || true
 
 # 未签名构建不写 entitlements，至少保证运行期能读到 App Group 字符串
 /usr/libexec/PlistBuddy -c "Set :SKAppGroup $APP_GROUP" "$OUT/Payload/SuperKill.app/Info.plist" >/dev/null 2>&1 || true
